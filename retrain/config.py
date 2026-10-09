@@ -35,9 +35,9 @@ class RunConfig:
     epochs: int = 3
     max_steps: int = 0
     lr: float = 1e-4
-    batch_size: int = 4
+    batch_size: int = 2          # tuned for ~5 GB usable VRAM (RTX 4050 6GB)
     eval_batch_size: int = 0         # 0 = same as train
-    grad_accum: int = 8
+    grad_accum: int = 16         # effective batch 32 at batch_size 2
     max_input_length: int = 1024
     max_target_length: int = 320
     weight_decay: float = 0.01
@@ -127,9 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--epochs", type=int, default=3)
         sp.add_argument("--max_steps", type=int, default=0)
         sp.add_argument("--lr", type=float, default=1e-4)
-        sp.add_argument("--batch_size", type=int, default=4)
+        sp.add_argument("--batch_size", type=int, default=2)
         sp.add_argument("--eval_batch_size", type=int, default=0)
-        sp.add_argument("--grad_accum", type=int, default=8)
+        sp.add_argument("--grad_accum", type=int, default=16)
         sp.add_argument("--max_input_length", type=int, default=1024)
         sp.add_argument("--max_target_length", type=int, default=320)
         sp.add_argument("--weight_decay", type=float, default=0.01)

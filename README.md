@@ -26,7 +26,20 @@ _retraining_phase23/
     kaggle_phase23.ipynb # slim: install, clone repo, run cli.py
 ```
 
-## Quick start (local)
+## Hardware profile (defaults target this)
+
+RTX 4050 6 GB (≈5 GB usable) + 16 GB RAM: `batch_size=2`,
+`grad_accum=16` (effective 32), fp16 4-bit QLoRA, `max_input_length=1024`.
+GRPO with G=4 candidates at batch 2 ≈ 8 concurrent generations — the heaviest
+op; lower `--rl_candidates` to 2 if VRAM trips. On bigger GPUs raise
+`--batch_size` and drop `--grad_accum` proportionally.
+
+## Rolling logs
+
+Every RL step appends one record **per candidate** (text, temperature,
+reward decomposition, group mean/std, database) to `rolling_data.jsonl`.
+After each eval the file is archived (`rolling_data.{label}.{timestamp}.jsonl`)
+and reset to blank, so each archive covers exactly one interval.
 
 ```bash
 pip install -r requirements.txt

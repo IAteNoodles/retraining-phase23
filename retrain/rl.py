@@ -114,6 +114,36 @@ class GRPOTrainer(Seq2SeqTrainer):
         t = cfg.train_temperature * (1.0 + c * spread)
         return max(cfg.train_temperature_min, t)
 
+    def _log_generations(self, cfg, inputs, pred_texts, gold_texts, databases,
+                           base_r, divs, simps, cons, rewards, temps,
+                           batch_size, G):
+        """Append one record per candidate: text, reward decomposition, temps."""
+        import datetime
+        import json
+        import os
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        in_texts = self._ctx.get("input_text") or [None] * batch_size
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.rolling_jsonl_path)), exist_ok=True)
+        with open(cfg.rolling_jsonl_path, "a", encoding="utf-8") as f:
+            for i in range(batch_size):
+                for c in range(G):
+                    f.write(json.dumps({
+                        "time": now, "kind": "rl_candidate",
+                        "step": int(self.state.global_step),
+                        "temperature": temps[c] if c < len(temps) else None,
+                        "input": in_texts[i] if i < len(in_texts) else None,
+                        "output": pred_texts[c * batch_size + i].strip(),
+                        "gold": gold_texts[i].strip(),
+                        "reward_exec": round(float(base_r[i, c]), 4),
+                        "reward_diversity": round(float(divs[i, c]), 4),
+                        "reward_simplicity": round(float(simps[i * G + c]), 4),
+                        "reward_consistency": round(float(cons[i, c]), 4),
+                        "reward_total": round(float(rewards[i, c]), 4),
+                        "group_mean": round(float(rewards[i].mean()), 4),
+                        "group_std": round(float(rewards[i].std()), 4),
+                        "database": databases[i] if i < len(databases) else None,
+                    }) + "\n")
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         from .rewards import compute_reward
 
@@ -212,6 +242,12 @@ class GRPOTrainer(Seq2SeqTrainer):
         rewards = (base_r + cfg.diversity_coef * divs
                    + cfg.simplicity_coef * np.array(simps, dtype=np.float64).reshape(batch_size, G)
                    + cfg.consistency_coef * cons)
+
+        # ── 2b. log EVERY generation: candidate text, reward parts, group stats ──
+        if cfg.rolling_jsonl_path:
+            self._log_generations(cfg, inputs, pred_texts, gold_texts, databases,
+                                  base_r, divs, simps, cons, rewards, temps,
+                                  batch_size, G)
 
         # ── 3. group-relative advantages (no critic) ──
         mean = rewards.mean(axis=1, keepdims=True)

@@ -123,7 +123,24 @@ def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
             rolling_jsonl_path, rolling_json_max_records, phase_name, label,
             decoded_preds, decoded_golds, dbs, inputs,
             jaccards if neo4j_client is not None else None)
+        rotate_rolling_log(rolling_jsonl_path, label)
     return metrics
+
+
+def rotate_rolling_log(path, label):
+    """Archive the current rolling log next to itself (timestamped), then
+    reset it to blank so the next eval starts fresh."""
+    import datetime
+    import shutil
+    if not path or not os.path.exists(path):
+        return ""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base, ext = os.path.splitext(path)
+    archived = f"{base}.{label}.{stamp}{ext or '.jsonl'}"
+    shutil.copyfile(path, archived)
+    open(path, "w").close()  # blank for the next round
+    print(f"  [rolling] archived {path} -> {archived}; reset to blank")
+    return archived
 
 
 def append_rolling_records(path, max_records, phase_name, label,
