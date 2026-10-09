@@ -83,7 +83,8 @@ class Text2CypherDataset(Dataset):
         self.dataset = ds.map(tokenize_fn, batched=True, batch_size=1000,
                               remove_columns=ds.column_names, desc="Tokenizing")
         self.dataset.set_format(type="torch",
-                                columns=["input_ids", "attention_mask", "labels", "length"])
+                                columns=["input_ids", "attention_mask", "labels", "length",
+                                         "input_length", "target_length"])
 
     def __len__(self):
         return len(self.dataset)

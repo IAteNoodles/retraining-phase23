@@ -103,12 +103,14 @@ def run_phase(cfg: RunConfig) -> str:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
     kl_ref = None
     if cfg.use_rl and cfg.kl_coef > 0:
-        from transformers import AutoModelForSeq2SeqLM as _AM
+        from transformers import AutoModelForSeq2SeqLM as _AM, BitsAndBytesConfig as _BNB
         kl_path = cfg.kl_ref_model_path or cfg.model_path
-        print(f"loading frozen KL reference: {kl_path}")
-        kl_ref = _AM.from_pretrained(
-            kl_path, local_files_only=True,
-            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16)
+        print(f"loading frozen KL reference (4-bit, same as policy): {kl_path}")
+        _bnb = _BNB(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+                    bnb_4bit_use_double_quant=True)
+        kl_ref = _AM.from_pretrained(kl_path, local_files_only=True,
+                                     quantization_config=_bnb)
         kl_ref.eval()
         for p in kl_ref.parameters():
             p.requires_grad_(False)

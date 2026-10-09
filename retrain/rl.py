@@ -28,6 +28,8 @@ import torch
 import torch.nn.functional as F
 from transformers import LogitsProcessor, LogitsProcessorList, Seq2SeqTrainer
 
+from .batching import BucketDataloaderMixin
+
 
 def _bigrams(text: str) -> set:
     toks = text.split()
@@ -74,7 +76,7 @@ class _GaussianNoise(LogitsProcessor):
         return scores
 
 
-class GRPOTrainer(Seq2SeqTrainer):
+class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
     def __init__(self, *args, tokenizer=None, cfg=None, neo4j_client=None,
                  kl_ref_model=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -257,39 +259,58 @@ class GRPOTrainer(Seq2SeqTrainer):
                              dtype=torch.float32)
         self.reward_ema = 0.9 * self.reward_ema + 0.1 * float(rewards.mean())
 
-        # ── 4. policy gradient on group candidates ──
-        dec_in = gen_ids[:, :-1]
-        tgt_ids = gen_ids[:, 1:]
-        outputs2 = model(input_ids=inputs["input_ids"].repeat(G, 1),
-                         attention_mask=inputs["attention_mask"].repeat(G, 1),
-                         decoder_input_ids=dec_in)
-        log_probs = F.log_softmax(outputs2.logits, dim=-1)
-        token_lp = log_probs.gather(2, tgt_ids.unsqueeze(-1)).squeeze(-1)
-        mask = (tgt_ids != pad_id).float()
-        seq_lp = (token_lp * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
-
-        grpo_loss = -(seq_lp * adv_t).mean()
+        # ── 4. policy gradient on group candidates, in chunks ──
+        # A full G×B stacked forward blows VRAM (logits over 262K vocab);
+        # process `rl_chunk_size` candidates at a time, accumulating the loss.
+        n_all = batch_size * G
+        chunk = max(1, min(cfg.rl_chunk_size, n_all))
+        order = torch.randperm(n_all, device=gen_ids.device)
+        acc_rl, acc_ent_num, acc_ent_den, acc_kl_num, acc_kl_den = 0.0, 0.0, 0.0, 0.0, 0.0
+        need_ent = bool(cfg.entropy_coef)
+        need_kl = bool(cfg.kl_coef and self.kl_ref_model is not None)
+        for s in range(0, n_all, chunk):
+            sl = order[s:s + chunk]
+            dec_slice = dec_in[sl]
+            tgt_slice = tgt_ids[sl]
+            adv_slice = adv_t[sl]
+            in_slice = inputs["input_ids"].repeat(G, 1)[sl]
+            mask_slice = inputs["attention_mask"].repeat(G, 1)[sl]
+            outputs2 = model(input_ids=in_slice, attention_mask=mask_slice,
+                             decoder_input_ids=dec_slice)
+            log_probs = F.log_softmax(outputs2.logits, dim=-1)
+            token_lp = log_probs.gather(2, tgt_slice.unsqueeze(-1)).squeeze(-1)
+            pmask = (tgt_slice != pad_id).float()
+            seq_lp = (token_lp * pmask).sum(dim=-1)
+            acc_rl = acc_rl + (seq_lp * adv_slice).sum() / n_all
+            if need_ent or need_kl:
+                probs = log_probs.detach().exp()
+                if need_ent:
+                    acc_ent_num = acc_ent_num + (-(probs * log_probs.detach()).sum(-1) * pmask).sum()
+                    acc_ent_den = acc_ent_den + pmask.sum()
+                if need_kl:
+                    with torch.no_grad():
+                        ref = self.kl_ref_model(input_ids=in_slice,
+                                                attention_mask=mask_slice,
+                                                decoder_input_ids=dec_slice)
+                        ref_lp = F.log_softmax(ref.logits, dim=-1)
+                    acc_kl_num = acc_kl_num + ((probs * (log_probs - ref_lp)).sum(-1) * pmask).sum()
+                    acc_kl_den = acc_kl_den + pmask.sum()
+                    del ref, ref_lp
+                del probs
+            del outputs2, log_probs
+        grpo_loss = -acc_rl
 
         if cfg.entropy_coef:
-            probs = log_probs.detach().exp()
-            ent = (-(probs * log_probs.detach()).sum(-1) * mask).sum() / mask.sum().clamp_min(1.0)
+            ent = acc_ent_num / acc_ent_den.clamp_min(1.0)
             ent_bonus = torch.clamp(ent - cfg.entropy_min, min=0.0)
             grpo_loss = grpo_loss - cfg.entropy_coef * ent_bonus
-            del probs
         else:
             ent = torch.tensor(0.0, device=grpo_loss.device)
 
-        if cfg.kl_coef and self.kl_ref_model is not None:
-            with torch.no_grad():
-                ref = self.kl_ref_model(
-                    input_ids=inputs["input_ids"].repeat(G, 1),
-                    attention_mask=inputs["attention_mask"].repeat(G, 1),
-                    decoder_input_ids=dec_in)
-                ref_lp = F.log_softmax(ref.logits, dim=-1)
-            kl = ((log_probs.exp() * (log_probs - ref_lp)).sum(-1) * mask).sum() / mask.sum().clamp_min(1.0)
+        if need_kl:
+            kl = acc_kl_num / acc_kl_den.clamp_min(1.0)
             kl = torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
             grpo_loss = grpo_loss + cfg.kl_coef * kl
-            del ref, ref_lp
         else:
             kl = torch.tensor(0.0, device=grpo_loss.device)
 
@@ -299,5 +320,4 @@ class GRPOTrainer(Seq2SeqTrainer):
             print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
                   f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
                   f"mean_r={rewards.mean():.3f}", flush=True)
-        del outputs2, log_probs
         return (total, None) if return_outputs else total

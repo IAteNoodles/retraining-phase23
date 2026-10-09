@@ -38,7 +38,14 @@ class RunConfig:
     batch_size: int = 2          # tuned for ~5 GB usable VRAM (RTX 4050 6GB)
     eval_batch_size: int = 0         # 0 = same as train
     grad_accum: int = 16         # effective batch 32 at batch_size 2
-    max_input_length: int = 1024
+    # token-budget batching: pack micro-batches to max_tokens AND
+    # max_target_tokens (targets OOM first: ~4 MB/token on 262K vocab),
+    # accumulate to ~target_step_tokens per optimizer step
+    dynamic_batch: bool = True
+    max_tokens: int = 6000       # micro-batch total-token budget
+    max_target_tokens: int = 800  # micro-batch target-token budget (binding)
+    target_step_tokens: int = 55000
+    max_input_length: int = 1536
     max_target_length: int = 320
     weight_decay: float = 0.01
     label_smoothing: float = 0.0
@@ -63,6 +70,7 @@ class RunConfig:
     use_rl: bool = False
     rl_coef: float = 0.3
     rl_candidates: int = 4          # GRPO group size G (>= 2)
+    rl_chunk_size: int = 2          # candidates per forward slice (VRAM bound)
     rl_every_n_steps: int = 2
     rl_warmup_steps: int = 50
     reward_ema_alpha: float = 0.1   # logging EMA only; baseline is group mean
@@ -130,7 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--batch_size", type=int, default=2)
         sp.add_argument("--eval_batch_size", type=int, default=0)
         sp.add_argument("--grad_accum", type=int, default=16)
-        sp.add_argument("--max_input_length", type=int, default=1024)
+        sp.add_argument("--dynamic_batch", action=argparse.BooleanOptionalAction, default=True)
+        sp.add_argument("--max_tokens", type=int, default=6000)
+        sp.add_argument("--max_target_tokens", type=int, default=800)
+        sp.add_argument("--target_step_tokens", type=int, default=55000)
+        sp.add_argument("--max_input_length", type=int, default=1536)
         sp.add_argument("--max_target_length", type=int, default=320)
         sp.add_argument("--weight_decay", type=float, default=0.01)
         sp.add_argument("--label_smoothing", type=float, default=0.0)
@@ -152,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--use_rl", action="store_true")
     t.add_argument("--rl_coef", type=float, default=0.3)
     t.add_argument("--rl_candidates", type=int, default=4)
+    t.add_argument("--rl_chunk_size", type=int, default=2)
     t.add_argument("--rl_every_n_steps", type=int, default=2)
     t.add_argument("--rl_warmup_steps", type=int, default=50)
     t.add_argument("--reward_ema_alpha", type=float, default=0.1)

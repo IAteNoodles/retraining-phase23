@@ -18,7 +18,6 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, TrainerCallba
 
 from .dataset import Text2CypherCollator
 
-
 class MinEpochEarlyStopping(TrainerCallback):
     """Stop when `metric` hasn't improved for `patience` evals, but never
     before `min_epochs` epochs have run."""
@@ -94,11 +93,26 @@ def _metric_direction(best_metric: str) -> tuple[str, bool]:
 
 def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
                   out_dir: str, cfg, use_rl: bool = False, **rl_kwargs):
+    from .batching import BucketDataloaderMixin, grad_accum_for_budget
     from .rl import GRPOTrainer
 
     metric, greater = _metric_direction(cfg.best_metric)
     best_dir = os.path.join(out_dir, "best")
     tracker = BestAdapterTracker(metric, greater, best_dir)
+
+    # token-budget batching: micro-batches packed to max_tokens, accumulation
+    # sized so each optimizer step sees ~target_step_tokens
+    bucket_cfg = None
+    effective_grad_accum = cfg.grad_accum
+    if cfg.dynamic_batch:
+        bucket_cfg = dict(max_batch_size=max(8, cfg.batch_size * 4),
+                          max_tokens=cfg.max_tokens,
+                          max_target_tokens=cfg.max_target_tokens,
+                          seed=cfg.seed)
+        effective_grad_accum = grad_accum_for_budget(cfg.target_step_tokens, cfg.max_tokens)
+        print(f"  [batching] micro-budget={cfg.max_tokens} tokens -> "
+              f"grad_accum={effective_grad_accum} (~{effective_grad_accum * cfg.max_tokens} tok/step)",
+              flush=True)
 
     ta_params = inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
     kwargs = dict(
@@ -106,7 +120,7 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
         num_train_epochs=cfg.epochs,
         per_device_train_batch_size=cfg.batch_size,
         per_device_eval_batch_size=cfg.eval_batch_size or cfg.batch_size,
-        gradient_accumulation_steps=cfg.grad_accum,
+        gradient_accumulation_steps=effective_grad_accum,
         learning_rate=cfg.lr,
         weight_decay=cfg.weight_decay,
         lr_scheduler_type="cosine",
@@ -152,7 +166,7 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
     else:
         from transformers import Seq2SeqTrainer as _T
 
-        class _SFT(_T):
+        class _SFT(BucketDataloaderMixin, _T):
             def _prepare_inputs(self, inputs):
                 if isinstance(inputs, dict):
                     for k in ("gold_answer", "database", "input_text", "index"):
@@ -161,6 +175,7 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
 
         trainer = _SFT(**base)
     tracker.trainer_ref = trainer
+    trainer.bucket_cfg = bucket_cfg
     return trainer, tracker
 
 
