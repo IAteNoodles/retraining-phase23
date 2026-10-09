@@ -1,0 +1,165 @@
+"""Run configuration: one dataclass, built from argparse. No globals."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RunConfig:
+    # data (separate files per phase - what you point at is what trains)
+    phase: int = 2
+    train_parquet: str = ""
+    val_parquet: str = ""
+    test_parquet: str = ""
+    schema_col: str = "schema_full"
+    question_col: str = "question"
+    target_col: str = "target"
+    schema_variant: str = ""          # e.g. "small,mid,full" subset of augmented files; "" = all
+    max_train_samples: int = 0        # 0 = all
+    max_val_samples: int = 0
+    max_test_samples: int = 0
+    seed: int = 42
+
+    # model
+    model_path: str = "t5gemma-270m"
+    output_dir: str = "./checkpoints/p2"
+    lora_r: int = 64
+    lora_dropout: float = 0.1
+    use_quant: bool = True
+    bf16: bool = False
+    fp16: bool = True
+
+    # optimization
+    epochs: int = 3
+    max_steps: int = 0
+    lr: float = 1e-4
+    batch_size: int = 4
+    eval_batch_size: int = 0         # 0 = same as train
+    grad_accum: int = 8
+    max_input_length: int = 1024
+    max_target_length: int = 320
+    weight_decay: float = 0.01
+    label_smoothing: float = 0.0
+    neftune_noise_alpha: float = 5.0
+    save_steps: int = 200
+    eval_steps: int = 200
+
+    # eval / metrics
+    eval_with_generate: bool = True
+    eval_samples: int = 500
+    exec_jaccard_threshold: float = 0.85
+    best_metric: str = "eval_execution_accuracy"  # or eval_loss / eval_exact_match
+
+    # neo4j (optional; required for RL + execution metrics)
+    neo4j_url: str = ""
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_fallback_db: str = "movies"
+    db_mapping_json: str = ""
+
+    # RL (phase 2+)
+    use_rl: bool = False
+    rl_coef: float = 0.3
+    rl_candidates: int = 1
+    rl_every_n_steps: int = 2        # explicit cadence (old code hardcoded 2)
+    rl_warmup_steps: int = 50
+    reward_ema_alpha: float = 0.1
+    critic_lr: float = 1e-4
+    disable_critic: bool = True      # encoder-only critic can't rank candidates; off by default
+    entropy_coef: float = 0.0
+    train_temperature: float = 0.7
+    train_top_k: int = 50
+    train_noise_scale: float = 0.0
+    kl_coef: float = 0.0
+    kl_ref_model_path: str = ""
+    exact_match_weight: float = 0.3
+    sft_coef: float = 1.0
+
+    # misc
+    resume_checkpoint: str = ""
+    eval_only: bool = False
+    eval_model_dir: str = ""
+    final_test_only: bool = False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="NL-to-Cypher retraining harness (phases 2/3)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def add_common(sp):
+        sp.add_argument("--phase", type=int, default=2)
+        sp.add_argument("--train_parquet", type=str, default="")
+        sp.add_argument("--val_parquet", type=str, default="")
+        sp.add_argument("--test_parquet", type=str, default="")
+        sp.add_argument("--schema_col", type=str, default="schema_full")
+        sp.add_argument("--question_col", type=str, default="question")
+        sp.add_argument("--target_col", type=str, default="target")
+        sp.add_argument("--schema_variant", type=str, default="")
+        sp.add_argument("--max_train_samples", type=int, default=0)
+        sp.add_argument("--max_val_samples", type=int, default=0)
+        sp.add_argument("--max_test_samples", type=int, default=0)
+        sp.add_argument("--seed", type=int, default=42)
+        sp.add_argument("--model_path", type=str, default="t5gemma-270m")
+        sp.add_argument("--output_dir", type=str, default="./checkpoints/p2")
+        sp.add_argument("--lora_r", type=int, default=64)
+        sp.add_argument("--lora_dropout", type=float, default=0.1)
+        sp.add_argument("--no_quant", action="store_true")
+        sp.add_argument("--bf16", action="store_true")
+        sp.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+        sp.add_argument("--epochs", type=int, default=3)
+        sp.add_argument("--max_steps", type=int, default=0)
+        sp.add_argument("--lr", type=float, default=1e-4)
+        sp.add_argument("--batch_size", type=int, default=4)
+        sp.add_argument("--eval_batch_size", type=int, default=0)
+        sp.add_argument("--grad_accum", type=int, default=8)
+        sp.add_argument("--max_input_length", type=int, default=1024)
+        sp.add_argument("--max_target_length", type=int, default=320)
+        sp.add_argument("--weight_decay", type=float, default=0.01)
+        sp.add_argument("--label_smoothing", type=float, default=0.0)
+        sp.add_argument("--neftune_noise_alpha", type=float, default=5.0)
+        sp.add_argument("--save_steps", type=int, default=200)
+        sp.add_argument("--eval_steps", type=int, default=200)
+        sp.add_argument("--eval_with_generate", action=argparse.BooleanOptionalAction, default=True)
+        sp.add_argument("--eval_samples", type=int, default=500)
+        sp.add_argument("--exec_jaccard_threshold", type=float, default=0.85)
+        sp.add_argument("--best_metric", type=str, default="eval_execution_accuracy")
+        sp.add_argument("--neo4j_url", type=str, default="")
+        sp.add_argument("--neo4j_user", type=str, default="neo4j")
+        sp.add_argument("--neo4j_password", type=str, default="")
+        sp.add_argument("--neo4j_fallback_db", type=str, default="movies")
+        sp.add_argument("--db_mapping_json", type=str, default="")
+
+    t = sub.add_parser("train", help="validate data, then run SFT (+ optional RL)")
+    add_common(t)
+    t.add_argument("--use_rl", action="store_true")
+    t.add_argument("--rl_coef", type=float, default=0.3)
+    t.add_argument("--rl_candidates", type=int, default=1)
+    t.add_argument("--rl_every_n_steps", type=int, default=2)
+    t.add_argument("--rl_warmup_steps", type=int, default=50)
+    t.add_argument("--reward_ema_alpha", type=float, default=0.1)
+    t.add_argument("--critic_lr", type=float, default=1e-4)
+    t.add_argument("--disable_critic", action=argparse.BooleanOptionalAction, default=True)
+    t.add_argument("--entropy_coef", type=float, default=0.0)
+    t.add_argument("--train_temperature", type=float, default=0.7)
+    t.add_argument("--train_top_k", type=int, default=50)
+    t.add_argument("--train_noise_scale", type=float, default=0.0)
+    t.add_argument("--kl_coef", type=float, default=0.0)
+    t.add_argument("--kl_ref_model_path", type=str, default="")
+    t.add_argument("--exact_match_weight", type=float, default=0.3)
+    t.add_argument("--sft_coef", type=float, default=1.0)
+    t.add_argument("--resume_checkpoint", type=str, default="")
+
+    e = sub.add_parser("eval", help="generation eval on val/test from a checkpoint dir")
+    add_common(e)
+    e.add_argument("--eval_model_dir", type=str, default="", required=True)
+    e.add_argument("--final_test_only", action="store_true")
+    return p
+
+
+def config_from_args(args: argparse.Namespace) -> RunConfig:
+    d = {k: v for k, v in vars(args).items() if k in RunConfig.__dataclass_fields__}
+    d["use_quant"] = not getattr(args, "no_quant", False)
+    d["fp16"] = bool(getattr(args, "fp16", True))
+    return RunConfig(**d)

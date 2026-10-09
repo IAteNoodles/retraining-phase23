@@ -1,0 +1,15 @@
+# code only - data, models, checkpoints stay local
+*.parquet
+*.jsonl
+*.safetensors
+*.bin
+*.dump
+checkpoints/
+*_output/
+*_logs/
+hf_*_cache/
+__pycache__/
+.venv/
+.env
+ rolling_data.jsonl
+rolling_data.json

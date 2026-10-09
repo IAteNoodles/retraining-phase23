@@ -1,0 +1,13 @@
+torch>=2.4
+transformers>=4.44
+accelerate
+datasets
+peft
+bitsandbytes
+safetensors
+sentencepiece
+pyarrow
+pandas
+requests
+neo4j
+tqdm
