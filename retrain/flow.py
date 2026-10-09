@@ -102,12 +102,23 @@ def run_phase(cfg: RunConfig) -> str:
     if cfg.use_rl and neo4j is None:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
     kl_ref = None
+    if cfg.use_rl and cfg.kl_coef > 0:
+        from transformers import AutoModelForSeq2SeqLM as _AM
+        kl_path = cfg.kl_ref_model_path or cfg.model_path
+        print(f"loading frozen KL reference: {kl_path}")
+        kl_ref = _AM.from_pretrained(
+            kl_path, local_files_only=True,
+            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16)
+        kl_ref.eval()
+        for p in kl_ref.parameters():
+            p.requires_grad_(False)
     best_dir = run_sft(model, tokenizer, train_ds, val_ds, cfg,
                        resume_checkpoint=cfg.resume_checkpoint,
                        use_rl=cfg.use_rl, neo4j_client=neo4j,
                        kl_ref_model=kl_ref)
     if neo4j is not None:
         neo4j.close()
+    del kl_ref
     print(f"=== phase {cfg.phase} done; best adapter: {best_dir} ===")
     return best_dir
 
@@ -141,7 +152,10 @@ def run_eval(cfg: RunConfig, model_dir: str):
                                 eval_batch_size=cfg.eval_batch_size or cfg.batch_size,
                                 neo4j_client=neo4j,
                                 exec_jaccard_threshold=cfg.exec_jaccard_threshold,
-                                max_samples=cfg.eval_samples)
+                                max_samples=cfg.eval_samples,
+                                rolling_jsonl_path=cfg.rolling_jsonl_path or os.path.join(out_dir, "rolling_data.jsonl"),
+                                rolling_json_max_records=cfg.rolling_json_max_records,
+                                phase_name=f"phase{cfg.phase}")
     test_ds = _mk(cfg.test_parquet, cfg.max_test_samples)
     if test_ds is not None:
         run_generation_eval(model, test_ds, tokenizer, collator, cfg.max_target_length,
@@ -149,6 +163,9 @@ def run_eval(cfg: RunConfig, model_dir: str):
                             eval_batch_size=cfg.eval_batch_size or cfg.batch_size,
                             neo4j_client=neo4j,
                             exec_jaccard_threshold=cfg.exec_jaccard_threshold,
-                            max_samples=cfg.eval_samples)
+                            max_samples=cfg.eval_samples,
+                            rolling_jsonl_path=cfg.rolling_jsonl_path or os.path.join(out_dir, "rolling_data.jsonl"),
+                            rolling_json_max_records=cfg.rolling_json_max_records,
+                            phase_name=f"phase{cfg.phase}")
     if neo4j is not None:
         neo4j.close()

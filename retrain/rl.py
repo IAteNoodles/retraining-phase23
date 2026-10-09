@@ -1,49 +1,100 @@
-"""REINFORCE stage. Differences from the old ReinforceTrainer:
+"""GRPO trainer (Group Relative Policy Optimization, Shao et al. 2024).
 
-- No global `args` leak: everything comes from the passed config object.
-- RL cadence is explicit (`rl_every_n_steps`, default 2 = old behavior).
-- Dead knobs removed (ppo_clip_eps, kl_adaptive_*, eos_suppress_*, diversity /
-  simplicity / consistency, dynamic_generation_length). Only the implemented
-  terms exist: SFT + REINFORCE + optional entropy + optional KL + critic.
-- Critic defaults to OFF: an encoder-mean baseline cannot rank multiple
-  candidates for the same input (identical input states). EMA baseline stays.
-- Rewards use per-sample database routing via the collator-provided context.
+Per prompt, sample a GROUP of G candidates from the current policy, then:
+  reward_i  = exec_jaccard + em_bonus + div_coef*diversity_i
+              + simp_coef*simplicity_i + cons_coef*consistency_i
+  advantage = (reward_i - mean(rewards)) / (std(rewards) + eps)   # no critic
+  loss      = -mean(advantage * mean_token_logprob) + kl_coef * KL(policy || ref)
+
+Shaping terms:
+- diversity_i    = 1 - mean pairwise bigram-Jaccard vs other candidates
+                   (rewards the group for covering different phrasings)
+- simplicity_i   = -(length drift vs gold) - bracket mismatch
+                   (rewards concise, balanced queries)
+- consistency_i  = 1 if candidate's execution result == group majority result
+                   else 0 (rewards stable answers; exec failures score 0)
+
+KL uses a frozen reference model (two-model setup). No PPO clipping, no
+adaptive controller, no critic - canonical GRPO.
 """
 
 from __future__ import annotations
 
 import gc
+import re
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 from transformers import LogitsProcessor, LogitsProcessorList, Seq2SeqTrainer
 
 
-class CriticNet(nn.Module):
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1))
-
-    def forward(self, encoder_hidden_states):
-        return self.net(encoder_hidden_states.mean(dim=1)).squeeze(-1)
+def _bigrams(text: str) -> set:
+    toks = text.split()
+    return set(zip(toks, toks[1:])) if len(toks) > 1 else set(toks)
 
 
-class ReinforceTrainer(Seq2SeqTrainer):
+def pairwise_dissimilarity(texts: list[str]) -> list[float]:
+    """1 - mean bigram-Jaccard vs every other candidate. All-identical -> 0."""
+    bags = [_bigrams(t) for t in texts]
+    out = []
+    for i, bi in enumerate(bags):
+        sims = []
+        for j, bj in enumerate(bags):
+            if i == j:
+                continue
+            union = bi | bj
+            sims.append(len(bi & bj) / len(union) if union else 1.0)
+        out.append(1.0 - (sum(sims) / len(sims) if sims else 0.0))
+    return out
+
+
+def simplicity(text: str, gold: str) -> float:
+    """<= 0. Compares length and bracket balance against gold."""
+    lp, lg = len(text.split()), max(len(gold.split()), 1)
+    drift = abs(lp / lg - 1.0)
+    brackets = abs(text.count("(") - text.count(")")) + abs(text.count("{") - text.count("}"))
+    return -(drift + 0.5 * brackets)
+
+
+class _ClampLogits(LogitsProcessor):
+    def __call__(self, input_ids, scores):
+        scores = torch.clamp(scores, min=-50.0, max=50.0)
+        return torch.where(torch.isfinite(scores), scores,
+                           torch.tensor(0.0, device=scores.device, dtype=scores.dtype))
+
+
+class _GaussianNoise(LogitsProcessor):
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def __call__(self, input_ids, scores):
+        if self.scale > 0:
+            return scores + torch.randn_like(scores) * self.scale
+        return scores
+
+
+class GRPOTrainer(Seq2SeqTrainer):
     def __init__(self, *args, tokenizer=None, cfg=None, neo4j_client=None,
                  kl_ref_model=None, **kwargs):
-        model = kwargs.get("model")
-        hidden = None
-        if model is not None:
-            hidden = getattr(model.config, "d_model", None) or getattr(model.config, "hidden_size", None)
-        self.critic = CriticNet(hidden).to(model.device) if hidden else None
         super().__init__(*args, **kwargs)
+        if cfg is None:
+            raise ValueError("GRPOTrainer requires cfg")
+        if cfg.rl_candidates < 2:
+            raise ValueError(f"GRPO needs rl_candidates >= 2 (got {cfg.rl_candidates}): "
+                             f"advantages are computed within the group")
+        if cfg.kl_coef > 0 and kl_ref_model is None:
+            raise ValueError("kl_coef > 0 requires a frozen reference model "
+                             "(--kl_ref_model_path)")
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.neo4j_client = neo4j_client
         self.kl_ref_model = kl_ref_model
-        self.reward_ema = 0.5
+        if kl_ref_model is not None:
+            kl_ref_model.eval()
+            for p in kl_ref_model.parameters():
+                p.requires_grad_(False)
+        self.reward_ema = 0.5  # logging only; GRPO baseline is the group mean
         self._rl_counter = 0
         self._ctx = {"gold_answer": None, "database": None, "input_text": None}
 
@@ -52,6 +103,16 @@ class ReinforceTrainer(Seq2SeqTrainer):
             self._ctx = {k: inputs.pop(k, None)
                          for k in ("gold_answer", "database", "input_text")}
         return super()._prepare_inputs(inputs)
+
+    def _candidate_temperature(self, c: int, total_steps: int) -> float:
+        cfg = self.cfg
+        if total_steps > 0:
+            progress = min(1.0, max(0.0, self.state.global_step / max(total_steps, 1)))
+        else:
+            progress = 0.0
+        spread = cfg.temp_spread_min + (cfg.temp_spread - cfg.temp_spread_min) * (1.0 - progress)
+        t = cfg.train_temperature * (1.0 + c * spread)
+        return max(cfg.train_temperature_min, t)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         from .rewards import compute_reward
@@ -62,127 +123,145 @@ class ReinforceTrainer(Seq2SeqTrainer):
         self._rl_counter += 1
         do_rl = model.training and (self._rl_counter % max(1, cfg.rl_every_n_steps) == 0)
 
-        model_t.config.output_hidden_states = do_rl
         outputs = model(**inputs)
         ce_loss = outputs.loss
-        encoder_hidden = outputs.encoder_last_hidden_state if do_rl else None
-        model_t.config.output_hidden_states = False
-
         if not torch.isfinite(ce_loss):
             print(f"  [RL_WARN] non-finite CE at step={self.state.global_step}; using 0.0", flush=True)
             ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=0.0, neginf=0.0)
         if not model.training:
             return (ce_loss, outputs) if return_outputs else ce_loss
         del outputs
-        if not do_rl:
-            return (ce_loss, None) if return_outputs else ce_loss
-        if self.state.global_step < cfg.rl_warmup_steps:
+        if not do_rl or self.state.global_step < cfg.rl_warmup_steps:
             return (ce_loss, None) if return_outputs else ce_loss
 
         pad_id = self.tokenizer.pad_token_id
         batch_size = inputs["input_ids"].shape[0]
-        n_cand = max(1, cfg.rl_candidates)
+        G = cfg.rl_candidates
+        total_steps = getattr(self.args, "max_steps", 0) or 0
 
+        # ── 1. sample a group of G candidates per prompt ──
         with torch.no_grad():
             model_t.config.use_cache = True
-            gen_batches = []
-            for _ in range(n_cand):
+            gen_batches, temps = [], []
+            for c in range(G):
+                temp = self._candidate_temperature(c, total_steps)
+                temps.append(round(temp, 3))
+                procs = LogitsProcessorList([_ClampLogits()])
+                if cfg.train_noise_scale > 0:
+                    procs.append(_GaussianNoise(cfg.train_noise_scale))
                 g = model_t.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
                     max_new_tokens=self.args.generation_max_length,
-                    do_sample=(n_cand > 1),
-                    temperature=cfg.train_temperature if n_cand > 1 else 1.0,
-                    top_k=cfg.train_top_k if n_cand > 1 else 50,
-                )
+                    do_sample=True, temperature=temp, top_k=cfg.train_top_k,
+                    logits_processor=procs)
                 gen_batches.append(g)
             model_t.config.use_cache = False
+            if self.state.global_step % 20 == 0:
+                print(f"  [GRPO] step={self.state.global_step} G={G} temps={temps} "
+                      f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale}", flush=True)
         gc.collect()
-
-        if n_cand > 1:
-            max_len = max(t.shape[1] for t in gen_batches)
-            gen_ids = torch.cat(
-                [torch.nn.functional.pad(t, (0, max_len - t.shape[1]), value=pad_id)
-                 for t in gen_batches], dim=0)
-        else:
-            gen_ids = gen_batches[0]
+        max_len = max(t.shape[1] for t in gen_batches)
+        gen_ids = torch.cat(
+            [torch.nn.functional.pad(t, (0, max_len - t.shape[1]), value=pad_id)
+             for t in gen_batches], dim=0)
 
         pred_texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         labels_np = labels.cpu().numpy()
         labels_np = np.where(labels_np != -100, labels_np, pad_id)
         gold_texts = self.tokenizer.batch_decode(labels_np, skip_special_tokens=True)
+        databases = self._ctx["database"] or [None] * batch_size
 
-        ctx = self._ctx
-        gold_answers = ctx["gold_answer"] or [None] * batch_size
-        databases = ctx["database"] or [None] * batch_size
-
-        rewards, jaccards, ems = [], [], []
-        best_ids = []
+        # ── 2. reward every candidate ──
+        base_r, exec_sets, simps = [], [], []
         for i in range(batch_size):
-            idxs = [c * batch_size + i for c in range(n_cand)]
-            cands = [pred_texts[j].strip() for j in idxs]
-            scored = []
-            for pos, c in enumerate(cands):
-                r = compute_reward(c, gold_texts[i].strip(), self.neo4j_client,
+            for c in range(G):
+                cand = pred_texts[c * batch_size + i].strip()
+                r = compute_reward(cand, gold_texts[i].strip(), self.neo4j_client,
                                    database=databases[i] if i < len(databases) else None)
-                em = 1.0 if c == gold_texts[i].strip() else 0.0
-                scored.append((r["jaccard"] + cfg.exact_match_weight * em,
-                               r["jaccard"], em, idxs[pos]))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            rewards.append(scored[0][0])
-            jaccards.append(scored[0][1])
-            ems.append(scored[0][2])
-            best_ids.append(gen_ids[scored[0][3]])
+                em = 1.0 if cand == gold_texts[i].strip() else 0.0
+                base_r.append(r["jaccard"] + cfg.exact_match_weight * em)
+                try:
+                    exec_sets.append(r.get("exec_set"))
+                except Exception:
+                    exec_sets.append(None)
+                simps.append(simplicity(cand, gold_texts[i].strip()))
 
-        rewards_t = torch.tensor(rewards, device=inputs["input_ids"].device, dtype=torch.float32)
-        if self.critic is not None and not cfg.disable_critic:
-            critic_pred = self.critic(encoder_hidden.detach())
-            advantage = rewards_t - critic_pred
-        else:
-            advantage = rewards_t - self.reward_ema
-        self.reward_ema = ((1 - cfg.reward_ema_alpha) * self.reward_ema
-                           + cfg.reward_ema_alpha * rewards_t.mean().item())
-        if self.state.global_step % 20 == 0:
-            print(f"  [R] step={self.state.global_step} "
-                  f"j=[{','.join(f'{j:.2f}' for j in jaccards)}] "
-                  f"rwd=[{','.join(f'{r:.2f}' for r in rewards)}] "
-                  f"ema={self.reward_ema:.3f} ce={ce_loss.item():.4f}", flush=True)
+        base_r = np.array(base_r, dtype=np.float64).reshape(batch_size, G)
 
-        best_ids = torch.stack(best_ids)
-        dec_in = best_ids[:, :-1]
-        tgt_ids = best_ids[:, 1:]
-        outputs2 = model(input_ids=inputs["input_ids"],
-                         attention_mask=inputs["attention_mask"],
+        # diversity is group-relative by construction
+        divs = []
+        for i in range(batch_size):
+            group_texts = [pred_texts[c * batch_size + i].strip() for c in range(G)]
+            divs.extend(pairwise_dissimilarity(group_texts))
+        divs = np.array(divs, dtype=np.float64).reshape(batch_size, G)
+
+        # consistency vs group majority execution result
+        cons = np.zeros((batch_size, G))
+        for i in range(batch_size):
+            votes: dict = {}
+            for c in range(G):
+                key = exec_sets[i * G + c]
+                if key is not None:
+                    votes[key] = votes.get(key, 0) + 1
+            if votes:
+                majority = max(votes, key=votes.get)
+                for c in range(G):
+                    cons[i, c] = 1.0 if exec_sets[i * G + c] == majority else 0.0
+
+        rewards = (base_r + cfg.diversity_coef * divs
+                   + cfg.simplicity_coef * np.array(simps, dtype=np.float64).reshape(batch_size, G)
+                   + cfg.consistency_coef * cons)
+
+        # ── 3. group-relative advantages (no critic) ──
+        mean = rewards.mean(axis=1, keepdims=True)
+        std = rewards.std(axis=1, keepdims=True) + 1e-4
+        adv = (rewards - mean) / std
+        adv_t = torch.tensor(adv.reshape(-1), device=inputs["input_ids"].device,
+                             dtype=torch.float32)
+        self.reward_ema = 0.9 * self.reward_ema + 0.1 * float(rewards.mean())
+
+        # ── 4. policy gradient on group candidates ──
+        dec_in = gen_ids[:, :-1]
+        tgt_ids = gen_ids[:, 1:]
+        outputs2 = model(input_ids=inputs["input_ids"].repeat(G, 1),
+                         attention_mask=inputs["attention_mask"].repeat(G, 1),
                          decoder_input_ids=dec_in)
         log_probs = F.log_softmax(outputs2.logits, dim=-1)
         token_lp = log_probs.gather(2, tgt_ids.unsqueeze(-1)).squeeze(-1)
         mask = (tgt_ids != pad_id).float()
-        seq_lp = (token_lp * mask).sum(dim=-1)
+        seq_lp = (token_lp * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
 
-        rl_loss = -(seq_lp * advantage.detach()).mean()
-        rl_loss = torch.nan_to_num(rl_loss, nan=0.0, posinf=0.0, neginf=0.0)
-        total = cfg.sft_coef * ce_loss + cfg.rl_coef * rl_loss
+        grpo_loss = -(seq_lp * adv_t).mean()
 
         if cfg.entropy_coef:
             probs = log_probs.detach().exp()
             ent = (-(probs * log_probs.detach()).sum(-1) * mask).sum() / mask.sum().clamp_min(1.0)
-            total = total - cfg.entropy_coef * torch.clamp(ent, min=0.0)
+            ent_bonus = torch.clamp(ent - cfg.entropy_min, min=0.0)
+            grpo_loss = grpo_loss - cfg.entropy_coef * ent_bonus
             del probs
+        else:
+            ent = torch.tensor(0.0, device=grpo_loss.device)
 
         if cfg.kl_coef and self.kl_ref_model is not None:
             with torch.no_grad():
-                ref = self.kl_ref_model(input_ids=inputs["input_ids"],
-                                        attention_mask=inputs["attention_mask"],
-                                        decoder_input_ids=dec_in)
+                ref = self.kl_ref_model(
+                    input_ids=inputs["input_ids"].repeat(G, 1),
+                    attention_mask=inputs["attention_mask"].repeat(G, 1),
+                    decoder_input_ids=dec_in)
                 ref_lp = F.log_softmax(ref.logits, dim=-1)
             kl = ((log_probs.exp() * (log_probs - ref_lp)).sum(-1) * mask).sum() / mask.sum().clamp_min(1.0)
-            total = total + cfg.kl_coef * torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
+            kl = torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
+            grpo_loss = grpo_loss + cfg.kl_coef * kl
             del ref, ref_lp
+        else:
+            kl = torch.tensor(0.0, device=grpo_loss.device)
 
-        if self.critic is not None and not cfg.disable_critic:
-            cl = F.mse_loss(critic_pred, rewards_t)
-            total = total + 0.1 * torch.nan_to_num(cl, nan=0.0, posinf=0.0, neginf=0.0)
-
+        total = cfg.sft_coef * ce_loss + cfg.rl_coef * grpo_loss
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.state.global_step % 20 == 0:
+            print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
+                  f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
+                  f"mean_r={rewards.mean():.3f}", flush=True)
         del outputs2, log_probs
         return (total, None) if return_outputs else total

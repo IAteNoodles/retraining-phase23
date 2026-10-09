@@ -72,5 +72,9 @@ def compute_reward(pred_cypher: str, gold_cypher: str, neo4j_client,
 
     garbage = min(2.0, sum(1 for ch in pred if ord(ch) > 127) / max(len(pred), 1) * 8)
     composite = max(-6.0, min(6.0, base + 2.0 * jac - garbage))
+    try:
+        exec_set = frozenset(tuple(r) for r in (pred_rows or [])) if exec_ok else None
+    except TypeError:
+        exec_set = None
     return {"branch": branch, "composite": composite, "jaccard": jac,
-            "exact": exact, "exec_ok": exec_ok}
+            "exact": exact, "exec_ok": exec_ok, "exec_set": exec_set}

@@ -37,7 +37,9 @@ def _levenshtein(a, b) -> int:
 def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
                         output_path, label="eval", eval_batch_size=8,
                         neo4j_client=None, exec_jaccard_threshold=0.85,
-                        max_samples=0, device="cuda"):
+                        max_samples=0, device="cuda",
+                        rolling_jsonl_path="", rolling_json_max_records=1000,
+                        phase_name=""):
     from torch.utils.data import Subset
     if max_samples and max_samples > 0 and len(dataset) > max_samples:
         dataset = Subset(dataset, list(range(max_samples)))
@@ -116,4 +118,37 @@ def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(metrics, f, indent=2, default=str)
+    if rolling_jsonl_path:
+        append_rolling_records(
+            rolling_jsonl_path, rolling_json_max_records, phase_name, label,
+            decoded_preds, decoded_golds, dbs, inputs,
+            jaccards if neo4j_client is not None else None)
     return metrics
+
+
+def append_rolling_records(path, max_records, phase_name, label,
+                           preds, golds, dbs, inputs, jaccards=None):
+    """Append per-sample records to a JSONL trace + capped JSON snapshot."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    records = []
+    for i, (p, g) in enumerate(zip(preds, golds)):
+        records.append({
+            "time": now, "phase": phase_name, "eval_label": label,
+            "input": inputs[i] if i < len(inputs) else None,
+            "output": p.strip(), "gold": g.strip(),
+            "jaccard": round(jaccards[i], 4) if jaccards is not None else None,
+            "database": dbs[i] if i < len(dbs) else None,
+        })
+    with open(path, "a", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    snap = path + ".snapshot.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        with open(snap, "w", encoding="utf-8") as f:
+            json.dump([json.loads(x) for x in lines[-max_records:]], f, indent=1)
+    except Exception:
+        pass

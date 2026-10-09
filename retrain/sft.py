@@ -19,6 +19,42 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, TrainerCallba
 from .dataset import Text2CypherCollator
 
 
+class MinEpochEarlyStopping(TrainerCallback):
+    """Stop when `metric` hasn't improved for `patience` evals, but never
+    before `min_epochs` epochs have run."""
+
+    def __init__(self, metric: str, greater_is_better: bool,
+                 patience: int = 5, min_epochs: float = 0.0):
+        self.metric = metric
+        self.greater_is_better = greater_is_better
+        self.patience = max(1, int(patience))
+        self.min_epochs = max(0.0, float(min_epochs))
+        self.best = None
+        self.bad = 0
+
+    def _better(self, value: float) -> bool:
+        if self.best is None:
+            return True
+        return value > self.best if self.greater_is_better else value < self.best
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics or self.metric not in metrics:
+            return
+        try:
+            value = float(metrics[self.metric])
+        except (TypeError, ValueError):
+            return
+        if self._better(value):
+            self.best = value
+            self.bad = 0
+        else:
+            self.bad += 1
+        if self.bad >= self.patience and state.epoch >= self.min_epochs:
+            print(f"  [early-stop] {self.metric} stagnant for {self.bad} evals "
+                  f"(best={self.best:.4f}, epoch={state.epoch:.2f})", flush=True)
+            control.should_training_stop = True
+
+
 class BestAdapterTracker(TrainerCallback):
     """Copies adapter weights to best_dir whenever `metric` improves."""
 
@@ -58,7 +94,7 @@ def _metric_direction(best_metric: str) -> tuple[str, bool]:
 
 def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
                   out_dir: str, cfg, use_rl: bool = False, **rl_kwargs):
-    from .rl import ReinforceTrainer
+    from .rl import GRPOTrainer
 
     metric, greater = _metric_direction(cfg.best_metric)
     best_dir = os.path.join(out_dir, "best")
@@ -108,9 +144,11 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
 
     base = dict(model=model, args=targs, train_dataset=train_dataset,
                 eval_dataset=val_dataset, data_collator=collator,
-                callbacks=[tracker], vram_limit_gb=None)
+                callbacks=[tracker])
+    if cfg.min_epochs > 0 and val_dataset is not None:
+        base["callbacks"].append(MinEpochEarlyStopping(metric, greater, min_epochs=cfg.min_epochs))
     if use_rl:
-        trainer = ReinforceTrainer(tokenizer=tokenizer, cfg=cfg, **rl_kwargs, **base)
+        trainer = GRPOTrainer(tokenizer=tokenizer, cfg=cfg, **rl_kwargs, **base)
     else:
         from transformers import Seq2SeqTrainer as _T
 
@@ -130,10 +168,15 @@ def run_sft(model, tokenizer, train_dataset, val_dataset, cfg,
             resume_checkpoint: str = "", use_rl: bool = False,
             neo4j_client=None, kl_ref_model=None) -> str:
     collator = Text2CypherCollator(tokenizer)
+    rl_kwargs = {}
+    if use_rl:
+        rl_kwargs = dict(
+            neo4j_client=neo4j_client,
+            kl_ref_model=kl_ref_model,
+        )
     trainer, tracker = build_trainer(
         model, tokenizer, train_dataset, val_dataset, collator,
-        cfg.output_dir, cfg, use_rl=use_rl, neo4j_client=neo4j_client,
-        kl_ref_model=kl_ref_model)
+        cfg.output_dir, cfg, use_rl=use_rl, **rl_kwargs)
     trainer.train(resume_from_checkpoint=resume_checkpoint or None)
     gc.collect()
     if tracker.best_value is None:

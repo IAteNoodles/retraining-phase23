@@ -59,23 +59,39 @@ class RunConfig:
     neo4j_fallback_db: str = "movies"
     db_mapping_json: str = ""
 
-    # RL (phase 2+)
+    # RL (GRPO)
     use_rl: bool = False
     rl_coef: float = 0.3
-    rl_candidates: int = 1
-    rl_every_n_steps: int = 2        # explicit cadence (old code hardcoded 2)
+    rl_candidates: int = 4          # GRPO group size G (>= 2)
+    rl_every_n_steps: int = 2
     rl_warmup_steps: int = 50
-    reward_ema_alpha: float = 0.1
-    critic_lr: float = 1e-4
-    disable_critic: bool = True      # encoder-only critic can't rank candidates; off by default
+    reward_ema_alpha: float = 0.1   # logging EMA only; baseline is group mean
     entropy_coef: float = 0.0
+    entropy_min: float = 0.0
     train_temperature: float = 0.7
+    train_temperature_min: float = 0.7
+    temp_spread: float = 0.0        # hotter later candidates: T*(1 + c*spread)
+    temp_spread_min: float = 0.0    # annealed floor when max_steps set
     train_top_k: int = 50
-    train_noise_scale: float = 0.0
+    train_noise_scale: float = 0.0  # Gaussian logit noise for exploration
     kl_coef: float = 0.0
-    kl_ref_model_path: str = ""
+    kl_ref_model_path: str = ""     # frozen reference; defaults to model_path
     exact_match_weight: float = 0.3
     sft_coef: float = 1.0
+    diversity_coef: float = 0.1     # 1 - mean pairwise bigram overlap
+    simplicity_coef: float = 0.05   # -(length drift + bracket mismatch)
+    consistency_coef: float = 0.1   # 1 if result == group majority else 0
+
+    # early stopping + diagnostics
+    min_epochs: float = 0.0         # floor before early stopping may fire (0 = off)
+    rolling_jsonl_path: str = ""    # per-sample pred/gold/reward trace; "" = off
+    rolling_json_max_records: int = 1000
+
+    # hub sync
+    hf_repo_id: str = ""
+    hf_token: str = ""
+    hf_path_prefix: str = ""
+    upload_checkpoints: bool = False
 
     # misc
     resume_checkpoint: str = ""
@@ -135,26 +151,48 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(t)
     t.add_argument("--use_rl", action="store_true")
     t.add_argument("--rl_coef", type=float, default=0.3)
-    t.add_argument("--rl_candidates", type=int, default=1)
+    t.add_argument("--rl_candidates", type=int, default=4)
     t.add_argument("--rl_every_n_steps", type=int, default=2)
     t.add_argument("--rl_warmup_steps", type=int, default=50)
     t.add_argument("--reward_ema_alpha", type=float, default=0.1)
-    t.add_argument("--critic_lr", type=float, default=1e-4)
-    t.add_argument("--disable_critic", action=argparse.BooleanOptionalAction, default=True)
     t.add_argument("--entropy_coef", type=float, default=0.0)
+    t.add_argument("--entropy_beta", type=float, default=None)   # v1 alias
+    t.add_argument("--entropy_min", type=float, default=0.0)
     t.add_argument("--train_temperature", type=float, default=0.7)
+    t.add_argument("--train_temperature_min", type=float, default=0.7)
+    t.add_argument("--temp_spread", type=float, default=0.0)
+    t.add_argument("--temp_spread_min", type=float, default=0.0)
     t.add_argument("--train_top_k", type=int, default=50)
+    t.add_argument("--top_k", type=int, default=None)           # v1 alias
     t.add_argument("--train_noise_scale", type=float, default=0.0)
     t.add_argument("--kl_coef", type=float, default=0.0)
+    t.add_argument("--kl_beta", type=float, default=None)       # v1 alias
     t.add_argument("--kl_ref_model_path", type=str, default="")
     t.add_argument("--exact_match_weight", type=float, default=0.3)
+    t.add_argument("--em_weight", type=float, default=None)     # v1 alias
     t.add_argument("--sft_coef", type=float, default=1.0)
+    t.add_argument("--diversity_coef", type=float, default=0.1)
+    t.add_argument("--simplicity_coef", type=float, default=0.05)
+    t.add_argument("--consistency_coef", type=float, default=0.1)
+    t.add_argument("--min_epochs", type=float, default=0.0)
+    t.add_argument("--rolling_jsonl_path", type=str, default="")
+    t.add_argument("--rolling_json_max_records", type=int, default=1000)
+    t.add_argument("--hf_repo_id", type=str, default="")
+    t.add_argument("--hf_token", type=str, default="")
+    t.add_argument("--hf_path_prefix", type=str, default="")
+    t.add_argument("--upload_checkpoints", action="store_true")
     t.add_argument("--resume_checkpoint", type=str, default="")
 
     e = sub.add_parser("eval", help="generation eval on val/test from a checkpoint dir")
     add_common(e)
     e.add_argument("--eval_model_dir", type=str, default="", required=True)
     e.add_argument("--final_test_only", action="store_true")
+
+    m = sub.add_parser("merge-latest", help="merge a LoRA adapter into a base model")
+    m.add_argument("--base_model", type=str, required=True)
+    m.add_argument("--adapter_dir", type=str, required=True)
+    m.add_argument("--out_dir", type=str, required=True)
+    m.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     return p
 
 
@@ -162,4 +200,14 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     d = {k: v for k, v in vars(args).items() if k in RunConfig.__dataclass_fields__}
     d["use_quant"] = not getattr(args, "no_quant", False)
     d["fp16"] = bool(getattr(args, "fp16", True))
-    return RunConfig(**d)
+    cfg = RunConfig(**d)
+    # v1 aliases (old train.py accepted both names)
+    if getattr(args, "entropy_beta", None) is not None:
+        cfg.entropy_coef = args.entropy_beta
+    if getattr(args, "em_weight", None) is not None:
+        cfg.exact_match_weight = args.em_weight
+    if getattr(args, "top_k", None) is not None:
+        cfg.train_top_k = args.top_k
+    if getattr(args, "kl_beta", None) is not None:
+        cfg.kl_coef = args.kl_beta
+    return cfg
