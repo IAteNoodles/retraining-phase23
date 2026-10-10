@@ -1878,7 +1878,7 @@ def run_training_phase(
     dataloader_num_workers=4, dataloader_pin_memory=True,
     use_bf16=False, use_fp16=False,
     max_steps=0, save_steps=200, hf_repo_id="", hf_token="", hf_path_prefix="",
-    eval_after_resume=False,
+    eval_after_resume=False, logging_steps=50,
 ):
     def _compute_metrics(eval_pred):
         return compute_metrics(eval_pred, tokenizer, neo4j_client=neo4j_client)
@@ -1956,6 +1956,9 @@ def run_training_phase(
 
     if "neftune_noise_alpha" in ta_params:
         training_kwargs["neftune_noise_alpha"] = neftune_noise_alpha
+
+    if "logging_steps" in ta_params:
+        training_kwargs["logging_steps"] = logging_steps
 
     if "warmup_ratio" in ta_params:
         training_kwargs["warmup_ratio"] = 0.06
@@ -2574,10 +2577,13 @@ def main():
     parser.add_argument("--max_steps", type=int, default=0, help="Stop after N optimizer steps (0 = unlimited)")
     parser.add_argument("--save_steps", type=int, default=200, help="Save checkpoint every N steps (default: 200)")
     parser.add_argument("--eval_steps", type=int, default=200, help="Evaluate every N steps (default: 200)")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Log training metrics every N steps (default: 50)")
+    parser.add_argument("--compile_model", action=argparse.BooleanOptionalAction, default=False, help="Compile the train model after LoRA attachment with torch.compile when available")
     parser.add_argument("--use_quant", action="store_true", help="Enable 4-bit quantization (default: BF16 full precision)")
     parser.add_argument("--compile_model", action=argparse.BooleanOptionalAction, default=False, help="Compile the train model after LoRA attachment with torch.compile when available")
     parser.add_argument("--compile_mode", type=str, default="default", help="torch.compile mode for --compile_model (default: 'default'; 'reduce-overhead' uses CUDAGraphs which cause partitioning with custom ops on T4)")
     parser.add_argument("--compile_eval", action=argparse.BooleanOptionalAction, default=False, help="Compile merged eval model (can increase overhead for tiny eval sets)")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Log training metrics every N steps (default: 50)")
     parser.add_argument("--precision", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Numeric precision policy for train/eval model loading")
     parser.add_argument("--hf_repo_id", type=str, default="", help="HuggingFace repo ID for uploading checkpoints (e.g., username/repo-name)")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace API token for uploading")
@@ -2835,6 +2841,7 @@ def main():
                 eval_batch_size=eval_batch_size,
                 max_steps=args.max_steps,
                 save_steps=args.save_steps,
+                logging_steps=args.logging_steps,
                 dynamic_batch=args.dynamic_batch,
                 max_tokens=args.max_tokens,
                 length_bucket_size=args.length_bucket_size,
