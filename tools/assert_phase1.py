@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--min_train_rows", type=int, default=100000)
     ap.add_argument("--leak_scan", type=int, default=0,
                     help="rows to leak-scan per split (0 = all)")
+    ap.add_argument("--hf_token", type=str, default="",
+                    help="HF token for private repo access")
     args = ap.parse_args()
 
     import pyarrow.parquet as pq
@@ -99,7 +101,7 @@ def main():
         except Exception as e:
             fail(f"legacy/{mod} broken: {e}")
 
-    if not os.environ.get("HF_TOKEN"):
+    if not args.hf_token:
         print("[warn] HF_TOKEN empty: private base download + checkpoint "
               "upload will fail", flush=True)
     print("ALL GATES PASSED", flush=True)
