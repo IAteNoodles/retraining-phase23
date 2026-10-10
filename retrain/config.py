@@ -101,6 +101,8 @@ class RunConfig:
     schema_coef: float = 0.3        # pred elements grounded in input schema
     entity_coef: float = 0.2        # question literals present in pred
     trivial_coef: float = 0.3       # penalty weight for shortcut queries
+    dbcost_coef: float = 1.0        # scales log execution-cost penalty
+    complexity_coef: float = 0.05   # -coef * max(0, C_pred - C_gold)
 
     # early stopping + diagnostics
     min_epochs: float = 0.0         # floor before early stopping may fire (0 = off)
@@ -211,6 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--schema_coef", type=float, default=0.3)
     t.add_argument("--entity_coef", type=float, default=0.2)
     t.add_argument("--trivial_coef", type=float, default=0.3)
+    t.add_argument("--dbcost_coef", type=float, default=1.0)
+    t.add_argument("--complexity_coef", type=float, default=0.05)
     t.add_argument("--min_epochs", type=float, default=0.0)
     t.add_argument("--rolling_jsonl_path", type=str, default="")
     t.add_argument("--rolling_json_max_records", type=int, default=1000)

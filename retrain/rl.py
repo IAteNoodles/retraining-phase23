@@ -128,7 +128,10 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 + cfg.structure_coef * r.get("structure", 0.0)
                 + cfg.schema_coef * r.get("schema", 0.0)
                 + cfg.entity_coef * r.get("entity", 0.0)
-                - cfg.trivial_coef * r.get("trivial", 0.0))
+                - cfg.trivial_coef * r.get("trivial", 0.0)
+                - cfg.dbcost_coef * r.get("dbcost", 0.0)
+                - cfg.complexity_coef * r.get("excess", 0)
+                + r.get("cross", 0.0))
         return r, em, simplicity(cand, gold), base
     def _candidate_temperature(self, c: int, total_steps: int) -> float:
         cfg = self.cfg
@@ -143,6 +146,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
     def _log_generations(self, cfg, inputs, pred_texts, gold_texts, databases,
                            base_r, divs, simps, cons, rewards, temps,
                            structs, schemas, entities, branches,
+                           crosses, excesses,
                            batch_size, G):
         """Append one record per candidate: text, reward decomposition, temps."""
         import datetime
@@ -165,6 +169,8 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                         "reward_structure": round(float(structs[i, c]), 4),
                         "reward_schema": round(float(schemas[i, c]), 4),
                         "reward_entity": round(float(entities[i, c]), 4),
+                        "reward_cross": round(float(crosses[i, c]), 4),
+                        "reward_excess": int(excesses[i, c]),
                         "reward_diversity": round(float(divs[i, c]), 4),
                         "reward_simplicity": round(float(simps[i * G + c]), 4),
                         "reward_consistency": round(float(cons[i, c]), 4),
@@ -295,6 +301,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         base_r, exec_sets, simps = [], [], []
         branches, raw_jac = [], []
         structs, schemas, entities = [], [], []
+        crosses, excesses = [], []
         for i in range(batch_size):
             for c in range(G):
                 r, em, s_, base = results[(i, c)]
@@ -303,6 +310,8 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 structs.append(r.get("structure", 0.0))
                 schemas.append(r.get("schema", 0.0))
                 entities.append(r.get("entity", 0.0))
+                crosses.append(r.get("cross", 0.0))
+                excesses.append(r.get("excess", 0))
                 branches.append(r.get("branch", "?"))
                 try:
                     exec_sets.append(r.get("exec_set"))
@@ -350,9 +359,12 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
             _stm = np.array(structs, dtype=np.float64).reshape(batch_size, G)
             _shm = np.array(schemas, dtype=np.float64).reshape(batch_size, G)
             _enm = np.array(entities, dtype=np.float64).reshape(batch_size, G)
+            _xsm = np.array(crosses, dtype=np.float64).reshape(batch_size, G)
+            _exm = np.array(excesses, dtype=np.float64).reshape(batch_size, G)
             self._log_generations(cfg, inputs, pred_texts, gold_texts, databases,
                                   base_r, divs, simps, cons, rewards, temps,
                                   _stm, _shm, _enm, branches,
+                                  _xsm, _exm,
                                   batch_size, G)
 
         # ── 3. group-relative advantages (no critic) ──
@@ -370,8 +382,10 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         _br = np.array(branches, dtype=object).reshape(batch_size, G)
         _sp = np.array(simps, dtype=np.float64).reshape(batch_size, G)
         _st = np.array(structs, dtype=np.float64).reshape(batch_size, G)
+        _xs = np.array(crosses, dtype=np.float64).reshape(batch_size, G)
         print(f"  [GRPO_SCORES] step={self.state.global_step}", flush=True)
         for i in range(batch_size):
+            xs = ''.join('!' if x < 0 else '.' for x in _xs[i])
             print(f"    prompt{i}: "
                   f"jac=[{','.join(f'{x:.2f}' for x in _rj[i])}] "
                   f"struct=[{','.join(f'{x:.2f}' for x in _st[i])}] "
@@ -380,7 +394,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                   f"cons=[{','.join(f'{x:.0f}' for x in cons[i])}] "
                   f"tot=[{','.join(f'{x:.2f}' for x in rewards[i])}] "
                   f"adv=[{','.join(f'{x:+.2f}' for x in adv[i])}] "
-                  f"branch=[{','.join(str(x) for x in _br[i])}]", flush=True)
+                  f"branch=[{','.join(str(x) for x in _br[i])}] xs={xs}", flush=True)
 
         # ── 4. policy gradient on group candidates, in chunks ──
         # A full G×B stacked forward blows VRAM (logits over 262K vocab);

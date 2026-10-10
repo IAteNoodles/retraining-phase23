@@ -125,6 +125,40 @@ def triviality(pred: str) -> float:
     return 0.0
 
 
+def complexity(cypher: str) -> int:
+    """Structural size: clause keywords + relationship patterns + labels."""
+    t = str(cypher or "")
+    n = len(re.findall(r"\b(MATCH|OPTIONAL\s+MATCH|WHERE|WITH|RETURN|ORDER\s+BY|LIMIT|CALL|UNWIND)\b",
+                       t, re.IGNORECASE))
+    n += len(re.findall(r"-\[[^\]]*\]->", t))
+    n += len(re.findall(r"<-\[[^\]]*\]-", t))
+    n += len(re.findall(r"\(:[A-Za-z_]\w*\)", t))
+    return n
+
+
+def db_cost(n_rows: int) -> float:
+    """Log-scaled execution cost in [0, ~1]: -0.05*log10(1+n) capped at 1.0
+    worth of penalty. Uses returned row count as the cost proxy (free -
+    already have the rows; PROFILE would double every Neo4j call)."""
+    import math
+    return min(1.0, 0.05 * math.log10(1 + max(0, int(n_rows))))
+
+
+def cross_schema(input_text: str, pred_labels: set, pred_rels: set) -> float:
+    """-5.0 when the prediction uses a different schema entirely: none of its
+    labels/rels appear in the input schema. Skipped when the prediction names
+    nothing (no evidence) or input schema is absent."""
+    from .data_checks import _schema_vocab
+    if not input_text or (not pred_labels and not pred_rels):
+        return 0.0
+    vl, vr, _ = _schema_vocab(input_text)
+    if not vl and not vr:
+        return 0.0
+    if (pred_labels - vl) == pred_labels and (pred_rels - vr) == pred_rels:
+        return -5.0
+    return 0.0
+
+
 def garbage_score(pred: str) -> float:
     """0..2: non-ASCII load + bracket imbalance + extra statements after ';'."""
     t = str(pred or "")
@@ -190,9 +224,14 @@ def compute_reward(pred_cypher: str, gold_cypher: str, neo4j_client,
     entity = entity_score(question, pred)
     garbage = garbage_score(pred)
     trivial = triviality(pred)
+    excess = max(0, complexity(pred) - complexity(gold)) if gold else 0
+    cross = cross_schema(input_text, pl, pr)
+    n_pred_rows = len(pred_rows) if exec_ok else 0
+    dbcost = db_cost(n_pred_rows)
     composite = max(-6.0, min(6.0, base + 2.0 * jac + 0.8 * struct["composite"]
                               + 0.3 * schema + 0.2 * entity
-                              - 0.5 * garbage - 0.3 * trivial))
+                              - 0.5 * garbage - 0.3 * trivial
+                              - 0.05 * excess + cross))
     try:
         exec_set = frozenset(tuple(r) for r in (pred_rows or [])) if exec_ok else None
     except TypeError:
@@ -205,4 +244,6 @@ def compute_reward(pred_cypher: str, gold_cypher: str, neo4j_client,
             "prop_f1": round(struct["prop_f1"], 4),
             "clause_f1": round(struct["clause_f1"], 4),
             "schema": round(schema, 4), "entity": round(entity, 4),
-            "garbage": round(garbage, 4), "trivial": trivial}
+            "garbage": round(garbage, 4), "trivial": trivial,
+            "excess": excess, "cross": cross, "n_rows": n_pred_rows,
+            "dbcost": round(dbcost, 4)}
