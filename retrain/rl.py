@@ -243,7 +243,15 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         batch_size = inputs["input_ids"].shape[0]
         G = cfg.rl_candidates
         total_steps = getattr(self.args, "max_steps", 0) or 0
-        gen_len = cfg.rl_max_new_tokens or self.args.generation_max_length
+        # adaptive decode budget: candidates only need ~gold length. Median
+        # gold is 16 tokens; decoding every micro to 1024 wastes minutes on
+        # runaways and inflates logits tensors. Floor 128, ceiling = cap.
+        try:
+            _gold_max = int((inputs["labels"] != -100).sum(dim=1).max().item())
+        except Exception:
+            _gold_max = 0
+        gen_len = min(int(cfg.rl_max_new_tokens or 448),
+                      max(128, _gold_max + 64))
         import time as _time
         t_rl0 = _time.perf_counter()
 

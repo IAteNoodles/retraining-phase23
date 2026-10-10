@@ -53,7 +53,7 @@ class RunConfig:
     target_step_tokens: int = 55000
     max_input_length: int = 1536  # advisory only; inputs are never truncated
     max_target_length: int = 1024  # generation/eval cap == target p100 (1019); no waste
-    rl_max_new_tokens: int = 320   # RL candidates stay short (VRAM); eval uses max_target_length
+    rl_max_new_tokens: int = 448   # hard ceiling for RL candidates (VRAM + time)
     weight_decay: float = 0.01
     label_smoothing: float = 0.0
     neftune_noise_alpha: float = 5.0
@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--rl_coef", type=float, default=0.3)
     t.add_argument("--rl_candidates", type=int, default=4)
     t.add_argument("--rl_chunk_size", type=int, default=2)
-    t.add_argument("--rl_max_new_tokens", type=int, default=0)
+    t.add_argument("--rl_max_new_tokens", type=int, default=448)
     t.add_argument("--rl_every_n_steps", type=int, default=2)
     t.add_argument("--rl_warmup_steps", type=int, default=50)
     t.add_argument("--reward_ema_alpha", type=float, default=0.1)

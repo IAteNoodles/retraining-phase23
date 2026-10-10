@@ -120,11 +120,15 @@ def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
     with open(output_path, "w") as f:
         json.dump(metrics, f, indent=2, default=str)
     if rolling_jsonl_path:
+        # eval records go to a LABELED SIBLING file; the training stream is
+        # never blanked (rotation used to archive+wipe it mid-run, "losing"
+        # all RL records at the end of every train).
+        base, ext = os.path.splitext(rolling_jsonl_path)
+        eval_path = f"{base}.{label}{ext or '.jsonl'}"
         append_rolling_records(
-            rolling_jsonl_path, rolling_json_max_records, phase_name, label,
+            eval_path, rolling_json_max_records, phase_name, label,
             decoded_preds, decoded_golds, dbs, inputs,
             jaccards if neo4j_client is not None else None)
-        rotate_rolling_log(rolling_jsonl_path, label)
     return metrics
 
 
