@@ -11,6 +11,7 @@ import json
 from urllib.parse import urlparse
 
 import requests
+import threading
 
 
 class Neo4jClient:
@@ -23,6 +24,7 @@ class Neo4jClient:
         self.fallback_db = fallback_db
         self.timeout = timeout
         self._cache: dict = {}
+        self._lock = threading.Lock()  # guards the shared HTTP session only
 
         parsed = urlparse(url)
         scheme = (parsed.scheme or "").lower()
@@ -65,10 +67,11 @@ class Neo4jClient:
                     result = [tuple(self._flatten(v) for v in rec.values())
                               for rec in s.run(stmt)]
             else:
-                url = f"{self.base}/db/{db}/query/v2"
-                resp = self.session.post(url, json={"statement": stmt, "parameters": {}},
-                                         timeout=self.timeout)
-                data = resp.json()
+                with self._lock:  # requests.Session is not thread-safe
+                    url = f"{self.base}/db/{db}/query/v2"
+                    resp = self.session.post(url, json={"statement": stmt, "parameters": {}},
+                                             timeout=self.timeout)
+                    data = resp.json()
                 if data.get("errors"):
                     result = None
                 else:

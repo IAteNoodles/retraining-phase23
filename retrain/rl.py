@@ -107,6 +107,13 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                          for k in ("gold_answer", "database", "input_text")}
         return super()._prepare_inputs(inputs)
 
+    def _reward_one(self, cfg, task):
+        from .rewards import compute_reward
+        i, c, cand, gold, db = task
+        r = compute_reward(cand, gold, self.neo4j_client, database=db)
+        em = 1.0 if cand == gold else 0.0
+        return r, em, simplicity(cand, gold)
+
     def _candidate_temperature(self, c: int, total_steps: int) -> float:
         cfg = self.cfg
         if total_steps > 0:
@@ -172,6 +179,8 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         G = cfg.rl_candidates
         total_steps = getattr(self.args, "max_steps", 0) or 0
         gen_len = cfg.rl_max_new_tokens or self.args.generation_max_length
+        import time as _time
+        t_rl0 = _time.perf_counter()
 
         # defragment before the memory-heavy section (generation + G× forward)
         torch.cuda.empty_cache()
@@ -242,21 +251,34 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         labels_np = np.where(labels_np != -100, labels_np, pad_id)
         gold_texts = self.tokenizer.batch_decode(labels_np, skip_special_tokens=True)
         databases = self._ctx["database"] or [None] * batch_size
+        t_gen_done = _time.perf_counter()
 
-        # ── 2. reward every candidate ──
+        # ── 2. reward every candidate (threaded: Neo4j calls are I/O-bound) ──
+        tasks = []
+        for i in range(batch_size):
+            for c in range(G):
+                tasks.append((i, c, pred_texts[c * batch_size + i].strip(),
+                              gold_texts[i].strip(),
+                              databases[i] if i < len(databases) else None))
+        import concurrent.futures as _fut
+        results = {}
+        with _fut.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(self._reward_one, cfg, t): t for t in tasks}
+            for fut in _fut.as_completed(futs):
+                i, c, _, _, _ = futs[fut]
+                results[(i, c)] = fut.result()
+        t_reward_done = _time.perf_counter()
+
         base_r, exec_sets, simps = [], [], []
         for i in range(batch_size):
             for c in range(G):
-                cand = pred_texts[c * batch_size + i].strip()
-                r = compute_reward(cand, gold_texts[i].strip(), self.neo4j_client,
-                                   database=databases[i] if i < len(databases) else None)
-                em = 1.0 if cand == gold_texts[i].strip() else 0.0
+                r, em, s_ = results[(i, c)]
                 base_r.append(r["jaccard"] + cfg.exact_match_weight * em)
                 try:
                     exec_sets.append(r.get("exec_set"))
                 except Exception:
                     exec_sets.append(None)
-                simps.append(simplicity(cand, gold_texts[i].strip()))
+                simps.append(s_)
 
         base_r = np.array(base_r, dtype=np.float64).reshape(batch_size, G)
 
@@ -360,7 +382,11 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         total = cfg.sft_coef * ce_loss + cfg.rl_coef * grpo_loss
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
         if self.state.global_step % 20 == 0:
+            import time as _t2
+            t_end = _t2.perf_counter()
             print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
                   f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
                   f"mean_r={rewards.mean():.3f}", flush=True)
+            print(f"  [GRPO_TIME] gen={t_gen_done - t_rl0:.1f}s reward={t_reward_done - t_gen_done:.1f}s "
+                  f"backward={(t_end - t_reward_done):.1f}s", flush=True)
         return (total, None) if return_outputs else total
