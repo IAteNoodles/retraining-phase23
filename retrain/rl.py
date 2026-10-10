@@ -309,6 +309,15 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                    + cfg.simplicity_coef * np.array(simps, dtype=np.float64).reshape(batch_size, G)
                    + cfg.consistency_coef * cons)
 
+        # circuit breaker: if NO candidate has a valid gold execution, the
+        # rewards are pure shaping noise - skip RL, keep SFT only
+        if all(b == "gold_exec_fail" for b in branches):
+            print(f"  [RL_SKIP] step={self.state.global_step}: all gold executions "
+                  f"failed (check Neo4j URL/auth/mapping) - SFT loss only", flush=True)
+            del gen_ids
+            gc.collect()
+            return (ce_loss, None) if return_outputs else ce_loss
+
         # ── 2b. log EVERY generation: candidate text, reward parts, group stats ──
         if cfg.rolling_jsonl_path:
             self._log_generations(cfg, inputs, pred_texts, gold_texts, databases,

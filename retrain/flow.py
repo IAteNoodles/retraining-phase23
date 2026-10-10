@@ -156,6 +156,9 @@ def run_phase(cfg: RunConfig) -> str:
     neo4j = build_neo4j(cfg) if cfg.neo4j_url else None
     if cfg.use_rl and neo4j is None:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
+    if neo4j is not None and not cfg.neo4j_password:
+        print("  [WARN] Neo4j password is empty - Bolt auth will fail and every "
+              "reward will be gold_exec_fail. Pass --neo4j_password.", flush=True)
     kl_ref = None
     if cfg.use_rl and cfg.kl_coef > 0:
         from transformers import AutoModelForSeq2SeqLM as _AM, BitsAndBytesConfig as _BNB
