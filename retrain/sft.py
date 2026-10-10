@@ -37,8 +37,13 @@ class MinEpochEarlyStopping(TrainerCallback):
         return value > self.best if self.greater_is_better else value < self.best
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not metrics or self.metric not in metrics:
+        if not metrics:
             return
+        if self.metric not in metrics:
+            if self.metric == "eval_loss":
+                return
+            self.metric, self.greater_is_better = "eval_loss", False
+            self.best, self.bad = None, 0
         try:
             value = float(metrics[self.metric])
         except (TypeError, ValueError):
@@ -55,7 +60,11 @@ class MinEpochEarlyStopping(TrainerCallback):
 
 
 class BestAdapterTracker(TrainerCallback):
-    """Copies adapter weights to best_dir whenever `metric` improves."""
+    """Copies adapter weights to best_dir whenever `metric` improves.
+
+    Falls back to eval_loss (the only metric HF always computes in-loop);
+    execution-based selection belongs to post-training run_eval.
+    """
 
     def __init__(self, metric: str, greater_is_better: bool, best_dir: str):
         self.metric = metric
@@ -63,6 +72,7 @@ class BestAdapterTracker(TrainerCallback):
         self.best_dir = best_dir
         self.best_value = None
         self.trainer_ref = None  # set by build_trainer (HF does not pass it)
+        self._fell_back = False
 
     def _is_better(self, value: float) -> bool:
         if self.best_value is None:
@@ -70,7 +80,14 @@ class BestAdapterTracker(TrainerCallback):
         return value > self.best_value if self.greater_is_better else value < self.best_value
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not metrics or self.metric not in metrics:
+        if not metrics:
+            return
+        if self.metric not in metrics and not self._fell_back:
+            self.metric, self.greater_is_better = "eval_loss", False
+            self._fell_back = True
+            print(f"  [best] execution metric unavailable in-loop; tracking eval_loss "
+                  f"(use run_eval for execution-based selection)", flush=True)
+        if self.metric not in metrics:
             return
         try:
             value = float(metrics[self.metric])
@@ -93,26 +110,35 @@ def _metric_direction(best_metric: str) -> tuple[str, bool]:
 
 def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
                   out_dir: str, cfg, use_rl: bool = False, **rl_kwargs):
-    from .batching import BucketDataloaderMixin, grad_accum_for_budget
+    from .batching import BucketDataloaderMixin
     from .rl import GRPOTrainer
 
     metric, greater = _metric_direction(cfg.best_metric)
     best_dir = os.path.join(out_dir, "best")
     tracker = BestAdapterTracker(metric, greater, best_dir)
 
-    # token-budget batching: micro-batches packed to max_tokens, accumulation
-    # sized so each optimizer step sees ~target_step_tokens
+    # token-budget batching: micro-batches packed to max_tokens AND
+    # max_target_tokens; accumulation measured so each optimizer step sees
+    # ~target_step_tokens (not guessed from the budget ceiling)
     bucket_cfg = None
     effective_grad_accum = cfg.grad_accum
     if cfg.dynamic_batch:
+        from .batching import TokenBucketBatchSampler
         bucket_cfg = dict(max_batch_size=max(8, cfg.batch_size * 4),
                           max_tokens=cfg.max_tokens,
                           max_target_tokens=cfg.max_target_tokens,
                           seed=cfg.seed)
-        effective_grad_accum = grad_accum_for_budget(cfg.target_step_tokens, cfg.max_tokens)
-        print(f"  [batching] micro-budget={cfg.max_tokens} tokens -> "
-              f"grad_accum={effective_grad_accum} (~{effective_grad_accum * cfg.max_tokens} tok/step)",
-              flush=True)
+        probe = TokenBucketBatchSampler(
+            train_dataset, max_batch_size=bucket_cfg["max_batch_size"],
+            max_tokens=cfg.max_tokens, max_target_tokens=cfg.max_target_tokens,
+            shuffle=False, seed=cfg.seed)
+        probe_batches = probe._build_batches()
+        mean_fill = (sum(sum(probe.lengths[i] for i in b) for b in probe_batches)
+                     / max(len(probe_batches), 1))
+        effective_grad_accum = max(1, int(round(cfg.target_step_tokens / max(mean_fill, 1))))
+        print(f"  [batching] micro-budget={cfg.max_tokens}/{cfg.max_target_tokens}tgt "
+              f"(mean fill {mean_fill:.0f}) -> grad_accum={effective_grad_accum} "
+              f"(~{effective_grad_accum * mean_fill:.0f} tok/step)", flush=True)
 
     ta_params = inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
     kwargs = dict(
@@ -133,8 +159,11 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
         save_steps=cfg.save_steps,
         save_total_limit=3,
         load_best_model_at_end=False,   # PEFT-incompatible; BestAdapterTracker handles it
-        metric_for_best_model=metric,
-        greater_is_better=greater,
+        # NOTE: HF requires this metric to exist in-loop; only eval_loss always
+        # does (we compute no in-loop metrics). BestAdapterTracker falls back
+        # to it independently; execution-based selection is a run_eval decision.
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         predict_with_generate=cfg.eval_with_generate,
         generation_max_length=cfg.max_target_length,
         report_to="none",

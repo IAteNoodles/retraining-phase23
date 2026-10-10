@@ -149,41 +149,62 @@ def validate(train_path, val_path, test_path, schema_col, question_col, target_c
     return rep
 
 
+def _split_sections(schema_text: str):
+    """Split a compact schema into (node_text, rel_text). Handles both
+    newline-separated ('N: ...\\nR: ...') and legacy inline ('... / R: ...')
+    section separators."""
+    s = str(schema_text or "")
+    m = re.search(r"(?:^|\n)\s*R\s*:\s*", s)
+    if m:
+        return s[:m.start()], s[m.end():]
+    m2 = re.search(r"\s+/\s*R\s*:\s*", s)
+    if m2:
+        return s[:m2.start()], s[m2.end():]
+    m3 = re.match(r"(?i)^\s*schema\s*:\s*", s)
+    body = s[m3.end():] if m3 else s
+    return body, ""
+
+
 def _schema_vocab(schema_text: str):
     """Lowercased label / rel-type / property tokens present in a compact schema."""
-    s = str(schema_text or "")
+    n_text, r_text = _split_sections(schema_text)
+    n_text = re.sub(r"(?i)^\s*(?:schema|N)\s*:\s*", "", n_text.strip())
     labels, rels, props = set(), set(), set()
-    for line in s.split("\n"):
-        body = re.sub(r"^(?:schema:|N:|R:)\s*", "", line.strip())
-        for item in body.split("|"):
-            item = item.strip()
-            if not item:
-                continue
-            if ">" in item:  # A>T{p}>B  (or bare TYPE without endpoints)
-                segs = [sg.strip() for sg in item.split(">")]
-                if len(segs) >= 3:
-                    a, b = segs[0].split("{")[0].strip(), segs[-1].split("{")[0].strip()
-                    if re.fullmatch(r"[A-Za-z_]\w*", a):
-                        labels.add(a.lower())
-                    if re.fullmatch(r"[A-Za-z_]\w*", b):
-                        labels.add(b.lower())
-                    for seg in segs[1:-1]:
-                        t = seg.split("{")[0].strip()
-                        if t:
-                            rels.add(t.lower())
-                        pm = re.search(r"\{([^}]*)\}", seg)
-                        if pm:
-                            props.update(p.strip().lower() for p in pm.group(1).split(",") if p.strip())
-                else:  # bare rel-type name
-                    t = segs[0].split("{")[0].strip()
+    for item in n_text.split("|"):
+        item = item.strip()
+        if not item:
+            continue
+        m = re.match(r"^([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?$", item)
+        if m:
+            labels.add(m.group(1).lower())
+            if m.group(2):
+                props.update(p.strip().lower() for p in m.group(2).split(",") if p.strip())
+    for item in r_text.split("|"):
+        item = item.strip()
+        if not item:
+            continue
+        if ">" in item:
+            segs = [sg.strip() for sg in item.split(">")]
+            if len(segs) >= 3:
+                if re.fullmatch(r"[A-Za-z_]\w*", segs[0].split("{")[0].strip()):
+                    labels.add(segs[0].split("{")[0].strip().lower())
+                if re.fullmatch(r"[A-Za-z_]\w*", segs[-1].split("{")[0].strip()):
+                    labels.add(segs[-1].split("{")[0].strip().lower())
+                for seg in segs[1:-1]:
+                    t = seg.split("{")[0].strip()
                     if t:
                         rels.add(t.lower())
-            else:  # node item: Label or Label(p1,p2)
-                m = re.match(r"^([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?$", item)
-                if m:
-                    labels.add(m.group(1).lower())
-                    if m.group(2):
-                        props.update(p.strip().lower() for p in m.group(2).split(",") if p.strip())
+                    pm = re.search(r"\{([^}]*)\}", seg)
+                    if pm:
+                        props.update(p.strip().lower() for p in pm.group(1).split(",") if p.strip())
+                continue
+        # bare rel-type name (no endpoints)
+        t = item.split("{")[0].strip()
+        if t:
+            rels.add(t.lower())
+        pm = re.search(r"\{([^}]*)\}", item)
+        if pm:
+            props.update(p.strip().lower() for p in pm.group(1).split(",") if p.strip())
     return labels, rels, props
 
 
@@ -203,7 +224,8 @@ def check_schema_coverage(split: pd.DataFrame, schema_col: str) -> int:
         tgt = str(row["_nt"])
         used_labels = set(re.findall(r"\(:([A-Za-z_]\w*)", tgt))
         used_labels |= set(re.findall(r"\([A-Za-z_]\w*\s*:\s*([A-Za-z_]\w*)", tgt))
-        used_rels = set(re.findall(r"\[:([A-Za-z_]\w*)", tgt))
+        used_rels = set(re.findall(r"\[\s*:([A-Za-z_]\w*)", tgt))
+        used_rels |= set(re.findall(r"\[[A-Za-z_]\w*\s*:\s*([A-Za-z_]\w*)", tgt))
         used_props = (set(re.findall(r"\.\s*([A-Za-z_]\w*)", tgt))
                       - NON_PROPS - {"id"})
         if ((used_labels - labels) or (used_rels - rels)

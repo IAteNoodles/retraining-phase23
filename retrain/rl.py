@@ -255,6 +255,8 @@ class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
         mean = rewards.mean(axis=1, keepdims=True)
         std = rewards.std(axis=1, keepdims=True) + 1e-4
         adv = (rewards - mean) / std
+        # clamp: near-identical groups have ~0 std which would explode advantages
+        adv = np.clip(adv, -5.0, 5.0)
         adv_t = torch.tensor(adv.reshape(-1), device=inputs["input_ids"].device,
                              dtype=torch.float32)
         self.reward_ema = 0.9 * self.reward_ema + 0.1 * float(rewards.mean())
@@ -262,6 +264,8 @@ class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
         # ── 4. policy gradient on group candidates, in chunks ──
         # A full G×B stacked forward blows VRAM (logits over 262K vocab);
         # process `rl_chunk_size` candidates at a time, accumulating the loss.
+        dec_in = gen_ids[:, :-1].contiguous()
+        tgt_ids = gen_ids[:, 1:].contiguous()
         n_all = batch_size * G
         chunk = max(1, min(cfg.rl_chunk_size, n_all))
         order = torch.randperm(n_all, device=gen_ids.device)

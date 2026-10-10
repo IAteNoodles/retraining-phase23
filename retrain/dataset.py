@@ -75,9 +75,10 @@ class Text2CypherDataset(Dataset):
                     ids = [-100 if t == pad else t for t in ids]
                 labels.append(ids)
             model_inputs["labels"] = labels
-            in_lens = [len(x) for x in model_inputs["input_ids"]]
-            tg_lens = [len(x) for x in labels]
-            model_inputs["length"] = [a + b for a, b in zip(in_lens, tg_lens)]
+            model_inputs["input_length"] = [len(x) for x in model_inputs["input_ids"]]
+            model_inputs["target_length"] = [len(x) for x in labels]
+            model_inputs["length"] = [a + b for a, b in zip(model_inputs["input_length"],
+                                                            model_inputs["target_length"])]
             return model_inputs
 
         self.dataset = ds.map(tokenize_fn, batched=True, batch_size=1000,
