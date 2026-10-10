@@ -64,8 +64,16 @@ class Neo4jClient:
         try:
             if self.mode == "bolt":
                 with self.driver.session(database=db) as s:
-                    result = [tuple(self._flatten(v) for v in rec.values())
-                              for rec in s.run(stmt)]
+                    # Server-side kill after `timeout`: untrained policies emit
+                    # cartesian-product garbage; without this the driver blocks
+                    # forever and the whole run hangs with GPU at 0%.
+                    # Row cap bounds transfer; jaccard/dbcost are log-scale so
+                    # a 10k cap barely moves them.
+                    result = []
+                    for rec in s.run(stmt, timeout=self.timeout):
+                        result.append(tuple(self._flatten(v) for v in rec.values()))
+                        if len(result) >= 10000:
+                            break
             else:
                 with self._lock:  # requests.Session is not thread-safe
                     url = f"{self.base}/db/{db}/query/v2"

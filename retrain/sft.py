@@ -165,6 +165,24 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
               f"(mean fill {mean_fill:.0f}) -> grad_accum={effective_grad_accum} "
               f"(~{effective_grad_accum * mean_fill:.0f} tok/step)", flush=True)
 
+    try:  # run_config.json was written before batching was measured; stamp it
+        import json as _json2
+        _rc_path = os.path.join(out_dir, "run_config.json")
+        _rc = {}
+        if os.path.exists(_rc_path):
+            with open(_rc_path, encoding="utf-8") as _rf:
+                _rc = _json2.load(_rf)
+        _rc.update({
+            "effective_grad_accum": effective_grad_accum,
+            "effective_micro_tokens": (micro_tokens if cfg.dynamic_batch else -1),
+            "effective_micro_target_tokens": (micro_tgt if cfg.dynamic_batch else -1),
+            "effective_mean_fill": (round(mean_fill) if cfg.dynamic_batch else 0),
+        })
+        with open(_rc_path, "w", encoding="utf-8") as _wf:
+            _json2.dump(_rc, _wf, indent=1, default=str)
+    except Exception:
+        pass
+
     ta_params = inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
     kwargs = dict(
         output_dir=out_dir,

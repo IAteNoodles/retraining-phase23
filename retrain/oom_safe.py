@@ -80,14 +80,28 @@ class OOMSafeMixin:
     def _shrink_budgets(self):
         cfg = getattr(self, "bucket_cfg", None)
         if isinstance(cfg, dict):
+            old_tok, old_tgt = cfg.get("max_tokens"), cfg.get("max_target_tokens")
             cfg["max_tokens"] = max(self.oom_min_tokens,
                                     int(cfg.get("max_tokens", 6000) * self.oom_shrink))
             cfg["max_target_tokens"] = max(
                 self.oom_min_target_tokens,
                 int(cfg.get("max_target_tokens", 500) * self.oom_shrink))
-            print(f"  [oom-redo] budgets shrunk to "
-                  f"{cfg['max_tokens']} total / {cfg['max_target_tokens']} target tokens",
+            print(f"  [oom-redo] budgets {old_tok}/{old_tgt}tgt -> "
+                  f"{cfg['max_tokens']}/{cfg['max_target_tokens']}tgt "
+                  f"(grad_accum unchanged: steps now see fewer tokens)",
                   flush=True)
+            try:  # keep run_config honest about the moving budgets
+                import json as _json3
+                _rc = os.path.join(self.args.output_dir, "run_config.json")
+                if os.path.exists(_rc):
+                    with open(_rc, encoding="utf-8") as _f:
+                        _d = _json3.load(_f)
+                    _d["micro_tokens_current"] = cfg["max_tokens"]
+                    _d["micro_target_current"] = cfg["max_target_tokens"]
+                    with open(_rc, "w", encoding="utf-8") as _f:
+                        _json3.dump(_d, _f, indent=1, default=str)
+            except Exception:
+                pass
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         try:
