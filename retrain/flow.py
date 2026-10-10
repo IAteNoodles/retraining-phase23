@@ -153,6 +153,12 @@ def run_phase(cfg: RunConfig) -> str:
     os.makedirs(cfg.output_dir, exist_ok=True)
     if not cfg.rolling_jsonl_path:
         cfg.rolling_jsonl_path = os.path.join(cfg.output_dir, "rolling_data.jsonl")
+    import dataclasses as _dc
+    import json as _json
+    with open(os.path.join(cfg.output_dir, "run_config.json"), "w") as f:
+        _json.dump(_dc.asdict(cfg), f, indent=1, default=str)
+    print(f"effective config saved to {os.path.join(cfg.output_dir, 'run_config.json')}",
+          flush=True)
     neo4j = build_neo4j(cfg) if cfg.neo4j_url else None
     if cfg.use_rl and neo4j is None:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
