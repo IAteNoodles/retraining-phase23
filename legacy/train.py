@@ -2154,7 +2154,9 @@ def upload_rolling_data_to_hf(output_dir, hf_repo_id, hf_token=None, hf_path_pre
     """Upload rolling eval logs next to the model/checkpoints on HF."""
     if not HF_AVAILABLE or not hf_repo_id:
         return
-    for filename in ("rolling_data.jsonl", "rolling_data.json"):
+    for filename in ("rolling_data.jsonl", "rolling_data.json",
+                       "final_eval_metrics.json", "final_test_metrics.json",
+                       "run_config.json", "training_args.json"):
         local_path = Path(output_dir) / filename
         if not local_path.exists():
             continue
