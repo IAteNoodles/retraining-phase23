@@ -103,6 +103,25 @@ def _gen_processors(cfg) -> LogitsProcessorList:
     return LogitsProcessorList(procs)
 
 
+class _PerRowTemperature(LogitsProcessor):
+    """Per-sequence temperature inside ONE batched generate call.
+
+    Sampling with temperature T is exactly `sample(top_k(scores / T))`,
+    so tiling prompts G-wide and scaling each row by its own T reproduces
+    G separate per-temperature calls with a single forward pass per step.
+    Must run AFTER noise (mirrors HF order: processors -> warpers) and
+    the generate call itself uses temperature=1.0 (neutral).
+    """
+
+    def __init__(self, temps):
+        self.temps = list(temps)
+
+    def __call__(self, input_ids, scores):
+        t = torch.as_tensor(self.temps, device=scores.device,
+                            dtype=scores.dtype).unsqueeze(1)
+        return scores / t.clamp_min(1e-3)
+
+
 class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
     def __init__(self, *args, tokenizer=None, cfg=None, neo4j_client=None,
                  kl_ref_model=None, **kwargs):
@@ -259,15 +278,22 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 g = g.view(B, G, -1).transpose(0, 1).reshape(B * G, -1)
                 gen_batches = [g[c * B:(c + 1) * B] for c in range(G)]
             else:
-                for c in range(G):
-                    procs = _gen_processors(cfg)
-                    g = model_t.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        max_new_tokens=gen_len,
-                        do_sample=True, temperature=temps[c], top_k=cfg.train_top_k,
-                        logits_processor=procs)
-                    gen_batches.append(g)
+                # spread temperatures: tile prompts G-wide, one call, per-row T.
+                # Row layout is prompt-major ([p0c0,p0c1,p0c2,p1c0,...]) so the
+                # downstream view(B, G, -1) recovers per-candidate batches.
+                B = inputs["input_ids"].shape[0]
+                tiled_ids = inputs["input_ids"].repeat_interleave(G, dim=0)
+                tiled_mask = inputs["attention_mask"].repeat_interleave(G, dim=0)
+                procs = _gen_processors(cfg)
+                procs.append(_PerRowTemperature(temps * B))
+                g = model_t.generate(
+                    input_ids=tiled_ids,
+                    attention_mask=tiled_mask,
+                    max_new_tokens=gen_len,
+                    do_sample=True, temperature=1.0, top_k=cfg.train_top_k,
+                    logits_processor=procs)
+                g = g.view(B, G, -1).transpose(0, 1).reshape(B * G, -1)
+                gen_batches = [g[c * B:(c + 1) * B] for c in range(G)]
             model_t.config.use_cache = False
             if had_ckpt:
                 try:
@@ -275,7 +301,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 except Exception:
                     pass
             if self.state.global_step % 20 == 0:
-                batched = "batched" if (G > 1 and len(set(temps)) == 1) else "sequential"
+                batched = "batched" if (G > 1 and len(set(temps)) == 1) else "tiled"
                 print(f"  [GRPO] step={self.state.global_step} G={G} temps={temps} "
                       f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale} "
                       f"norepeat={cfg.train_no_repeat_ngram_size} "
