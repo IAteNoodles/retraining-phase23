@@ -54,6 +54,28 @@ class OOMSafeMixin:
     oom_min_tokens = 1000
     oom_min_target_tokens = 200
 
+    def prediction_step(self, *args, **kwargs):
+        # in-loop eval generates with predict_with_generate: ckpt is
+        # backward-only machinery, but left on it forces use_cache=False
+        # (the warning + O(n^2) decode). Off around predict, back on after.
+        model_t = getattr(self, "model", None)
+        model_t = model_t.module if hasattr(model_t, "module") else model_t
+        had = False
+        try:
+            if hasattr(model_t, "gradient_checkpointing_disable"):
+                model_t.gradient_checkpointing_disable()
+                had = True
+        except Exception:
+            had = False
+        try:
+            return super().prediction_step(*args, **kwargs)
+        finally:
+            try:
+                if had:
+                    model_t.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
     def _record_skipped(self, inputs, step=None, err=""):
         try:
             def _len(x):
