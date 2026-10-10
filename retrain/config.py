@@ -42,8 +42,9 @@ class RunConfig:
     # max_target_tokens (targets OOM first: ~4 MB/token on 262K vocab),
     # accumulate to ~target_step_tokens per optimizer step
     dynamic_batch: bool = True
-    max_tokens: int = 6000       # micro-batch total-token budget
-    max_target_tokens: int = 800  # micro-batch target-token budget (binding)
+    max_tokens: int = 6000       # micro-batch total-token budget (inputs are cheap)
+    max_target_tokens: int = 500  # micro-batch target-token budget (BINDING:
+                                  # 800 OOMs on 6 GB; logits scale with vocab)
     target_step_tokens: int = 55000
     max_input_length: int = 1536
     max_target_length: int = 320
@@ -140,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--grad_accum", type=int, default=16)
         sp.add_argument("--dynamic_batch", action=argparse.BooleanOptionalAction, default=True)
         sp.add_argument("--max_tokens", type=int, default=6000)
-        sp.add_argument("--max_target_tokens", type=int, default=800)
+        sp.add_argument("--max_target_tokens", type=int, default=500)
         sp.add_argument("--target_step_tokens", type=int, default=55000)
         sp.add_argument("--max_input_length", type=int, default=1536)
         sp.add_argument("--max_target_length", type=int, default=320)
