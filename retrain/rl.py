@@ -26,7 +26,9 @@ import re
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import LogitsProcessor, LogitsProcessorList, Seq2SeqTrainer
+from transformers import (LogitsProcessor, LogitsProcessorList,
+                            NoRepeatNGramLogitsProcessor,
+                            RepetitionPenaltyLogitsProcessor, Seq2SeqTrainer)
 
 from .batching import BucketDataloaderMixin
 from .oom_safe import OOMSafeMixin
@@ -86,6 +88,19 @@ class _GaussianNoise(LogitsProcessor):
         if self.scale > 0:
             return scores + torch.randn_like(scores) * self.scale
         return scores
+
+
+def _gen_processors(cfg) -> LogitsProcessorList:
+    """Shared sampling guards for RL generation. Repetition controls are
+    opt-in (defaults = off) so the base config is untouched unless asked."""
+    procs: list = [_ClampLogits()]
+    if cfg.train_noise_scale > 0:
+        procs.append(_GaussianNoise(cfg.train_noise_scale))
+    if getattr(cfg, "train_no_repeat_ngram_size", 0) and cfg.train_no_repeat_ngram_size > 0:
+        procs.append(NoRepeatNGramLogitsProcessor(cfg.train_no_repeat_ngram_size))
+    if getattr(cfg, "train_repetition_penalty", 1.0) not in (0.0, 1.0):
+        procs.append(RepetitionPenaltyLogitsProcessor(cfg.train_repetition_penalty))
+    return LogitsProcessorList(procs)
 
 
 class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
@@ -233,9 +248,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 temps.append(round(temp, 3))
             if G > 1 and len(set(temps)) == 1:
                 # uniform temperature: one batched call, G sequences per prompt
-                procs = LogitsProcessorList([_ClampLogits()])
-                if cfg.train_noise_scale > 0:
-                    procs.append(_GaussianNoise(cfg.train_noise_scale))
+                procs = _gen_processors(cfg)
                 g = model_t.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
@@ -247,9 +260,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 gen_batches = [g[c * B:(c + 1) * B] for c in range(G)]
             else:
                 for c in range(G):
-                    procs = LogitsProcessorList([_ClampLogits()])
-                    if cfg.train_noise_scale > 0:
-                        procs.append(_GaussianNoise(cfg.train_noise_scale))
+                    procs = _gen_processors(cfg)
                     g = model_t.generate(
                         input_ids=inputs["input_ids"],
                         attention_mask=inputs["attention_mask"],
@@ -266,7 +277,9 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
             if self.state.global_step % 20 == 0:
                 batched = "batched" if (G > 1 and len(set(temps)) == 1) else "sequential"
                 print(f"  [GRPO] step={self.state.global_step} G={G} temps={temps} "
-                      f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale} ({batched})", flush=True)
+                      f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale} "
+                      f"norepeat={cfg.train_no_repeat_ngram_size} "
+                      f"reppen={cfg.train_repetition_penalty} ({batched})", flush=True)
         gc.collect()
         max_len = max(t.shape[1] for t in gen_batches)
         gen_ids = torch.cat(

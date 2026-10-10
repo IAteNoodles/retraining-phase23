@@ -90,6 +90,8 @@ class RunConfig:
     temp_spread_min: float = 0.0    # annealed floor when max_steps set
     train_top_k: int = 50
     train_noise_scale: float = 0.0  # Gaussian logit noise for exploration
+    train_no_repeat_ngram_size: int = 0  # 0 = off; 3 blocks runaway repeat loops
+    train_repetition_penalty: float = 1.0  # 1.0 = off; 1.1-1.2 discourages loops
     kl_coef: float = 0.0
     kl_ref_model_path: str = ""     # frozen reference; defaults to model_path
     exact_match_weight: float = 0.3
@@ -200,6 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--train_top_k", type=int, default=50)
     t.add_argument("--top_k", type=int, default=None)           # v1 alias
     t.add_argument("--train_noise_scale", type=float, default=0.0)
+    t.add_argument("--train_no_repeat_ngram_size", type=int, default=0)
+    t.add_argument("--train_repetition_penalty", type=float, default=1.0)
     t.add_argument("--kl_coef", type=float, default=0.0)
     t.add_argument("--kl_beta", type=float, default=None)       # v1 alias
     t.add_argument("--kl_ref_model_path", type=str, default="")
