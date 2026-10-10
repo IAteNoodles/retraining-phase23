@@ -70,22 +70,30 @@ class TokenBucketBatchSampler(Sampler):
         self.epoch = 0
         self.lengths = [sample_length(dataset, i) for i in range(len(dataset))]
         self.target_lengths = [sample_lengths(dataset, i)[1] for i in range(len(dataset))]
+        self._iter_count = 0    # Trainer never calls set_epoch on a
+        self._built_count = None  # batch_sampler; advance per __iter__ instead
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
 
-    def _build_batches(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
+    def _build_batches(self, epoch: int | None = None):
+        ep = self.epoch if epoch is None else epoch
+        rng = np.random.default_rng(self.seed + ep)
         indices = sorted(range(len(self.dataset)), key=lambda i: self.lengths[i])
+        if self.shuffle and len(indices) > 1:
+            # random cyclic shift: pool MEMBERSHIP varies per epoch while
+            # every pool stays a contiguous (similar-length) slice
+            shift = int(rng.integers(0, len(indices)))
+            indices = indices[shift:] + indices[:shift]
         pools = [indices[i:i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
         if self.shuffle:
             rng.shuffle(pools)
-            for pool in pools:
-                rng.shuffle(pool)
         batches = []
         for pool in pools:
+            # pack in SORTED order (no inner shuffle): minimal padding, and
+            # the fattest rows never ambush a micro-batch mid-epoch
             batch, batch_tokens, batch_tgt = [], 0, 0
-            for idx in pool:
+            for idx in sorted(pool, key=lambda i: self.lengths[i]):
                 sample_tokens = max(1, self.lengths[idx])
                 sample_tgt = max(0, self.target_lengths[idx])
                 if batch and (len(batch) >= self.max_batch_size
@@ -104,10 +112,15 @@ class TokenBucketBatchSampler(Sampler):
         return batches
 
     def __iter__(self):
-        return iter(self._build_batches())
+        batches = self._build_batches(self.epoch + self._iter_count)
+        self._built_count = len(batches)
+        self._iter_count += 1
+        return iter(batches)
 
     def __len__(self):
-        return len(self._build_batches())
+        if self._built_count is not None:
+            return self._built_count
+        return len(self._build_batches(self.epoch))
 
 
 class BucketDataloaderMixin:
