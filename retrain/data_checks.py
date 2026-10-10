@@ -217,8 +217,13 @@ NON_PROPS = {"year", "years", "quarter", "quarters", "month", "months",
 
 
 def check_schema_coverage(split: pd.DataFrame, schema_col: str) -> int:
-    """Rows whose gold Cypher references something absent from its schema."""
+    """Rows whose gold Cypher references something absent from its schema.
+
+    `noprops`-variant rows are intentionally property-free: labels and rel
+    types are still enforced, only the property check is skipped for them.
+    """
     miss = 0
+    has_variant = "schema_variant" in split.columns
     for _, row in split.iterrows():
         labels, rels, props = _schema_vocab(row[schema_col])
         tgt = str(row["_nt"])
@@ -228,6 +233,10 @@ def check_schema_coverage(split: pd.DataFrame, schema_col: str) -> int:
         used_rels |= set(re.findall(r"\[[A-Za-z_]\w*\s*:\s*([A-Za-z_]\w*)", tgt))
         used_props = (set(re.findall(r"\.\s*([A-Za-z_]\w*)", tgt))
                       - NON_PROPS - {"id"})
+        if has_variant and str(row["schema_variant"]) == "noprops":
+            if (used_labels - labels) or (used_rels - rels):
+                miss += 1
+            continue
         if ((used_labels - labels) or (used_rels - rels)
                 or (used_props - props)):
             miss += 1
