@@ -120,10 +120,16 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
 
     def _reward_one(self, cfg, task):
         from .rewards import compute_reward
-        i, c, cand, gold, db = task
-        r = compute_reward(cand, gold, self.neo4j_client, database=db)
+        i, c, cand, gold, db, inp = task
+        r = compute_reward(cand, gold, self.neo4j_client, database=db,
+                           input_text=inp)
         em = 1.0 if cand == gold else 0.0
-        return r, em, simplicity(cand, gold)
+        base = (r["jaccard"] + cfg.exact_match_weight * em
+                + cfg.structure_coef * r.get("structure", 0.0)
+                + cfg.schema_coef * r.get("schema", 0.0)
+                + cfg.entity_coef * r.get("entity", 0.0)
+                - cfg.trivial_coef * r.get("trivial", 0.0))
+        return r, em, simplicity(cand, gold), base
     def _candidate_temperature(self, c: int, total_steps: int) -> float:
         cfg = self.cfg
         if total_steps > 0:
@@ -136,6 +142,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
 
     def _log_generations(self, cfg, inputs, pred_texts, gold_texts, databases,
                            base_r, divs, simps, cons, rewards, temps,
+                           structs, schemas, entities, branches,
                            batch_size, G):
         """Append one record per candidate: text, reward decomposition, temps."""
         import datetime
@@ -155,6 +162,9 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                         "output": pred_texts[c * batch_size + i].strip(),
                         "gold": gold_texts[i].strip(),
                         "reward_exec": round(float(base_r[i, c]), 4),
+                        "reward_structure": round(float(structs[i, c]), 4),
+                        "reward_schema": round(float(schemas[i, c]), 4),
+                        "reward_entity": round(float(entities[i, c]), 4),
                         "reward_diversity": round(float(divs[i, c]), 4),
                         "reward_simplicity": round(float(simps[i * G + c]), 4),
                         "reward_consistency": round(float(cons[i, c]), 4),
@@ -265,28 +275,34 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         t_gen_done = _time.perf_counter()
 
         # ── 2. reward every candidate (threaded: Neo4j calls are I/O-bound) ──
+        in_texts = self._ctx.get("input_text") or [None] * batch_size
         tasks = []
         for i in range(batch_size):
             for c in range(G):
                 tasks.append((i, c, pred_texts[c * batch_size + i].strip(),
                               gold_texts[i].strip(),
-                              databases[i] if i < len(databases) else None))
+                              databases[i] if i < len(databases) else None,
+                              in_texts[i] if i < len(in_texts) else None))
         import concurrent.futures as _fut
         results = {}
         with _fut.ThreadPoolExecutor(max_workers=8) as ex:
             futs = {ex.submit(self._reward_one, cfg, t): t for t in tasks}
             for fut in _fut.as_completed(futs):
-                i, c, _, _, _ = futs[fut]
+                i, c, _, _, _, _ = futs[fut]
                 results[(i, c)] = fut.result()
         t_reward_done = _time.perf_counter()
 
         base_r, exec_sets, simps = [], [], []
         branches, raw_jac = [], []
+        structs, schemas, entities = [], [], []
         for i in range(batch_size):
             for c in range(G):
-                r, em, s_ = results[(i, c)]
-                base_r.append(r["jaccard"] + cfg.exact_match_weight * em)
+                r, em, s_, base = results[(i, c)]
+                base_r.append(base)
                 raw_jac.append(r["jaccard"])
+                structs.append(r.get("structure", 0.0))
+                schemas.append(r.get("schema", 0.0))
+                entities.append(r.get("entity", 0.0))
                 branches.append(r.get("branch", "?"))
                 try:
                     exec_sets.append(r.get("exec_set"))
@@ -331,8 +347,12 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
 
         # ── 2b. log EVERY generation: candidate text, reward parts, group stats ──
         if cfg.rolling_jsonl_path:
+            _stm = np.array(structs, dtype=np.float64).reshape(batch_size, G)
+            _shm = np.array(schemas, dtype=np.float64).reshape(batch_size, G)
+            _enm = np.array(entities, dtype=np.float64).reshape(batch_size, G)
             self._log_generations(cfg, inputs, pred_texts, gold_texts, databases,
                                   base_r, divs, simps, cons, rewards, temps,
+                                  _stm, _shm, _enm, branches,
                                   batch_size, G)
 
         # ── 3. group-relative advantages (no critic) ──
@@ -349,10 +369,12 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         _rj = np.array(raw_jac, dtype=np.float64).reshape(batch_size, G)
         _br = np.array(branches, dtype=object).reshape(batch_size, G)
         _sp = np.array(simps, dtype=np.float64).reshape(batch_size, G)
+        _st = np.array(structs, dtype=np.float64).reshape(batch_size, G)
         print(f"  [GRPO_SCORES] step={self.state.global_step}", flush=True)
         for i in range(batch_size):
             print(f"    prompt{i}: "
                   f"jac=[{','.join(f'{x:.2f}' for x in _rj[i])}] "
+                  f"struct=[{','.join(f'{x:.2f}' for x in _st[i])}] "
                   f"div=[{','.join(f'{x:.2f}' for x in divs[i])}] "
                   f"simp=[{','.join(f'{x:.2f}' for x in _sp[i])}] "
                   f"cons=[{','.join(f'{x:.0f}' for x in cons[i])}] "

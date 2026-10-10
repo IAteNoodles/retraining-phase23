@@ -97,6 +97,10 @@ class RunConfig:
     diversity_coef: float = 0.1     # 1 - mean pairwise bigram overlap
     simplicity_coef: float = 0.15   # -(length error + 3x repetition + brackets)
     consistency_coef: float = 0.1   # 1 if result == group majority else 0
+    structure_coef: float = 0.8     # 0.30 AST-proxy + F1s (vs gold)
+    schema_coef: float = 0.3        # pred elements grounded in input schema
+    entity_coef: float = 0.2        # question literals present in pred
+    trivial_coef: float = 0.3       # penalty weight for shortcut queries
 
     # early stopping + diagnostics
     min_epochs: float = 0.0         # floor before early stopping may fire (0 = off)
@@ -201,8 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--em_weight", type=float, default=None)     # v1 alias
     t.add_argument("--sft_coef", type=float, default=1.0)
     t.add_argument("--diversity_coef", type=float, default=0.1)
-    t.add_argument("--simplicity_coef", type=float, default=0.05)
+    t.add_argument("--simplicity_coef", type=float, default=0.15)
     t.add_argument("--consistency_coef", type=float, default=0.1)
+    t.add_argument("--structure_coef", type=float, default=0.8)
+    t.add_argument("--schema_coef", type=float, default=0.3)
+    t.add_argument("--entity_coef", type=float, default=0.2)
+    t.add_argument("--trivial_coef", type=float, default=0.3)
     t.add_argument("--min_epochs", type=float, default=0.0)
     t.add_argument("--rolling_jsonl_path", type=str, default="")
     t.add_argument("--rolling_json_max_records", type=int, default=1000)
