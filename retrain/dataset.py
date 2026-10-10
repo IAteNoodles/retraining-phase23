@@ -59,10 +59,15 @@ class Text2CypherDataset(Dataset):
                 raise ValueError("target text found inside a model input - refusing to build dataset")
 
         def tokenize_fn(batch):
+            # NOTE: nothing is EVER truncated here - not inputs, not targets.
+            # A long row keeps every token; the bucket sampler isolates
+            # oversized rows into solo micro-batches so they still fit, and
+            # oom-redo skip-logs the hopeless cases instead of crashing.
+            # max_input_length / max_target_length only bound GENERATION.
             rendered = [f"schema: {str(s).strip()}\nquestion: {str(q).strip()}"
                         for s, q in zip(batch[schema_col], batch[question_col])]
-            model_inputs = tokenizer(rendered, max_length=max_input_length,
-                                     padding=False, truncation=True, add_special_tokens=True)
+            model_inputs = tokenizer(rendered, padding=False, truncation=False,
+                                     add_special_tokens=True)
             label_enc = tokenizer(
                 batch[target_col],
                 # NOTE: targets are NEVER truncated. A long gold query keeps

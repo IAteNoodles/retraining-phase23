@@ -51,8 +51,8 @@ class RunConfig:
                                        # coexists with the CE graph, so RL
                                        # steps need smaller micros
     target_step_tokens: int = 55000
-    max_input_length: int = 1536
-    max_target_length: int = 1024  # generation/eval cap: covers target p100
+    max_input_length: int = 1536  # advisory only; inputs are never truncated
+    max_target_length: int = 2048  # generation/eval cap: covers target p100=1019
     rl_max_new_tokens: int = 320   # RL candidates stay short (VRAM); eval uses max_target_length
     weight_decay: float = 0.01
     label_smoothing: float = 0.0
@@ -155,9 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--rl_micro_target_tokens", type=int, default=350)
         sp.add_argument("--target_step_tokens", type=int, default=55000)
         sp.add_argument("--max_input_length", type=int, default=1536)
-        sp.add_argument("--max_target_length", type=int, default=1024,
+        sp.add_argument("--max_target_length", type=int, default=2048,
                         help="Generation/eval output cap (covers target p100). "
-                             "Training targets are NEVER truncated.")
+                             "Training inputs and targets are NEVER truncated.")
         sp.add_argument("--weight_decay", type=float, default=0.01)
         sp.add_argument("--label_smoothing", type=float, default=0.0)
         sp.add_argument("--neftune_noise_alpha", type=float, default=5.0)
