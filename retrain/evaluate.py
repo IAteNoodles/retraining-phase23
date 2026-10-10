@@ -161,6 +161,7 @@ def append_rolling_records(path, max_records, phase_name, label,
     with open(path, "a", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r) + "\n")
+            f.flush()  # visible to tail -Wait immediately
     snap = path + ".snapshot.json"
     try:
         with open(path, encoding="utf-8") as f:

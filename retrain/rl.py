@@ -153,6 +153,7 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                         "group_std": round(float(rewards[i].std()), 4),
                         "database": databases[i] if i < len(databases) else None,
                     }) + "\n")
+                    f.flush()  # visible to tail -Wait the moment it's written
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         from .rewards import compute_reward
@@ -381,12 +382,12 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
 
         total = cfg.sft_coef * ce_loss + cfg.rl_coef * grpo_loss
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
-        if self.state.global_step % 20 == 0:
-            import time as _t2
-            t_end = _t2.perf_counter()
-            print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
-                  f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
-                  f"mean_r={rewards.mean():.3f}", flush=True)
-            print(f"  [GRPO_TIME] gen={t_gen_done - t_rl0:.1f}s reward={t_reward_done - t_gen_done:.1f}s "
-                  f"backward={(t_end - t_reward_done):.1f}s", flush=True)
+        import time as _t2
+        t_end = _t2.perf_counter()
+        print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
+              f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
+              f"mean_r={rewards.mean():.3f}", flush=True)
+        print(f"  [GRPO_TIME] step={self.state.global_step} "
+              f"gen={t_gen_done - t_rl0:.1f}s reward={t_reward_done - t_gen_done:.1f}s "
+              f"backward={(t_end - t_reward_done):.1f}s", flush=True)
         return (total, None) if return_outputs else total
