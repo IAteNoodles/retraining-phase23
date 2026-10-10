@@ -1853,6 +1853,7 @@ def run_training_phase(
     dataloader_num_workers=4, dataloader_pin_memory=True,
     use_bf16=False, use_fp16=False,
     max_steps=0, save_steps=200, hf_repo_id="", hf_token="", hf_path_prefix="",
+    eval_after_resume=False,
 ):
     def _compute_metrics(eval_pred):
         return compute_metrics(eval_pred, tokenizer, neo4j_client=neo4j_client)
@@ -2022,6 +2023,29 @@ def run_training_phase(
     if sample_eval_callback is not None:
         sample_eval_callback.trainer = trainer
 
+    # In-loop eval generation must be greedy: base generation_config ships
+    # do_sample=True/top_k/top_p, which routes Trainer prediction_step through
+    # torch.multinomial and device-asserts on degenerate fp16 probs.
+    # Explicit sampling callers (RL, final generation eval) pass their own kwargs.
+    try:
+        if getattr(model.generation_config, "do_sample", False):
+            model.generation_config.do_sample = False
+            print("[EvalGen] Forced greedy in-loop eval generation (do_sample=False).")
+    except Exception as e:
+        print(f"[EvalGen] Could not force greedy eval generation: {e}")
+
+    if eval_after_resume and resume_checkpoint:
+        print(f"\n[ResumeEval] Running loss eval immediately after resume from {resume_checkpoint}...")
+        try:
+            resume_metrics = trainer.evaluate()
+            resume_path = os.path.join(output_dir, "resume_eval_metrics.json")
+            with open(resume_path, "w", encoding="utf-8") as f:
+                json.dump(resume_metrics, f, indent=2, default=str)
+            print(f"[ResumeEval] Metrics: {resume_metrics}")
+            print(f"[ResumeEval] Saved to {resume_path}")
+        except Exception as e:
+            print(f"[ResumeEval] Post-resume eval failed (continuing to training): {e}")
+
     if is_main_process():
         print(f"\n{'='*60}")
         print(f"  {phase_name}: {len(train_dataset)} train, {len(val_dataset)} val")
@@ -2041,6 +2065,9 @@ def run_training_phase(
         train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
         print(f"\n{phase_name} complete. Metrics: {train_result.metrics}")
     except RuntimeError as e:
+        _save_crash_checkpoint(trainer, output_dir, phase_name,
+                               hf_repo_id=hf_repo_id, hf_token=hf_token,
+                               hf_path_prefix=hf_path_prefix)
         if "out of memory" in str(e).lower() or "CUDA out of memory" in str(e):
             print(f"\n*** OOM in {phase_name} ***")
             print(f"VRAM: {get_vram_info()}")
@@ -2072,6 +2099,35 @@ def run_training_phase(
     tokenizer.save_pretrained(best_dir)
     print(f"Best model saved to {best_dir}")
     return best_dir
+
+
+def _save_crash_checkpoint(trainer, output_dir, phase_name,
+                           hf_repo_id="", hf_token="", hf_path_prefix=""):
+    """Best-effort: persist + upload current weights so ANY crash is resumable.
+
+    Uses standard checkpoint-{step} naming so --resume_checkpoint picks it up.
+    After a device-side assert the CUDA context is poisoned and GPU-tensor
+    reads fail; OOM and CPU-side errors save fine. Never raises.
+    """
+    try:
+        step = getattr(getattr(trainer, "state", None), "global_step", 0)
+    except Exception:
+        step = 0
+    try:
+        trainer._save_checkpoint(trainer.model, None)
+        print(f"[CrashSave] {phase_name} weights saved at step {step} "
+              f"(resumable via --resume_checkpoint).")
+    except Exception as e:
+        print(f"[CrashSave] Weight save failed (CUDA context may be poisoned): {e}")
+        return
+    if HF_AVAILABLE and hf_repo_id:
+        crash_dir = os.path.join(output_dir, f"checkpoint-{step}")
+        try:
+            upload_checkpoint_to_hub(crash_dir, hf_repo_id, hf_token=hf_token,
+                                     hf_path_prefix=hf_path_prefix)
+            print(f"[CrashSave] Crash checkpoint uploaded to {hf_repo_id}.")
+        except Exception as e:
+            print(f"[CrashSave] Crash upload failed: {e}")
 
 
 def login_to_hf(hf_token):
@@ -2156,6 +2212,7 @@ def upload_rolling_data_to_hf(output_dir, hf_repo_id, hf_token=None, hf_path_pre
         return
     for filename in ("rolling_data.jsonl", "rolling_data.json",
                        "final_eval_metrics.json", "final_test_metrics.json",
+                       "resume_eval_metrics.json",
                        "run_config.json", "training_args.json"):
         local_path = Path(output_dir) / filename
         if not local_path.exists():
@@ -2391,6 +2448,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true", help="Show resume selection prompt inside train.py")
     parser.add_argument("--resume_checkpoint", type=str, default="", help="Explicit checkpoint path to resume from (recommended for notebook-controlled flow)")
+    parser.add_argument("--eval_after_resume", action="store_true", help="Run loss eval immediately after resuming from a checkpoint")
     parser.add_argument("--eval_only", action="store_true", help="Only run post-training eval on best checkpoint")
     parser.add_argument("--eval_model_dir", type=str, default="", help="Explicit full model/checkpoint directory for --eval_only. Can point to best/, best_checkpoint/, checkpoint-*, merged_eval/, or a parent containing those.")
     parser.add_argument("--final_test_only", action="store_true", help="With --eval_only, skip validation eval and run only the final test set")
@@ -2750,6 +2808,7 @@ def main():
                 hf_repo_id=args.hf_repo_id,
                 hf_token=args.hf_token,
                 hf_path_prefix=hf_path_prefix,
+                eval_after_resume=args.eval_after_resume,
             )
             if best_dir is None:
                 return
@@ -2950,6 +3009,7 @@ def main():
                     hf_repo_id=args.hf_repo_id,
                     hf_token=args.hf_token,
                     hf_path_prefix=hf_path_prefix,
+                    eval_after_resume=args.eval_after_resume,
                 )
                 if phase2_best is not None:
                     best_dir = phase2_best
