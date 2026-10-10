@@ -269,9 +269,10 @@ def run_generation_eval(eval_model, dataset, tokenizer, collator, max_target_len
 
     try:
         with torch.inference_mode():
+            _gen_device = next(eval_model.parameters()).device
             for i, batch in enumerate(tqdm(eval_loader, desc=f"Evaluating ({label})")):
-                input_ids = batch["input_ids"].to("cuda")
-                attention_mask = batch["attention_mask"].to("cuda")
+                input_ids = batch["input_ids"].to(_gen_device)
+                attention_mask = batch["attention_mask"].to(_gen_device)
                 labels = batch["labels"]
 
                 generated = eval_model.generate(
@@ -548,6 +549,8 @@ class HFHubUploadCallback(TrainerCallback):
         """Called after a checkpoint is saved."""
         if not HF_AVAILABLE or not self.hf_repo_id:
             return
+        if not is_main_process():
+            return  # DDP: rank 0 uploads once; other ranks skip.
         
         checkpoint_path = Path(args.output_dir) / f"checkpoint-{state.global_step}"
         if checkpoint_path.exists() and checkpoint_path != self.last_uploaded:
@@ -575,6 +578,8 @@ class SaveBeforeEvalCallback(TrainerCallback):
 
     def on_evaluate(self, args, state, control, **kwargs):
         """Called right before evaluation. Save and upload checkpoint."""
+        if not is_main_process():
+            return  # DDP: rank 0 uploads once; other ranks skip.
         if self.last_saved_step == state.global_step:
             # Already saved at this step, skip
             return
@@ -2469,6 +2474,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Show resume selection prompt inside train.py")
     parser.add_argument("--resume_checkpoint", type=str, default="", help="Explicit checkpoint path to resume from (recommended for notebook-controlled flow)")
     parser.add_argument("--eval_after_resume", action="store_true", help="Run loss eval immediately after resuming from a checkpoint")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for torchrun/DDP (also read from LOCAL_RANK env)")
     parser.add_argument("--eval_only", action="store_true", help="Only run post-training eval on best checkpoint")
     parser.add_argument("--eval_model_dir", type=str, default="", help="Explicit full model/checkpoint directory for --eval_only. Can point to best/, best_checkpoint/, checkpoint-*, merged_eval/, or a parent containing those.")
     parser.add_argument("--final_test_only", action="store_true", help="With --eval_only, skip validation eval and run only the final test set")
@@ -2578,6 +2584,17 @@ def main():
     parser.add_argument("--hf_path_prefix", type=str, default="", help="Optional HF repo subdirectory for checkpoint/model sync, e.g. phase_2")
     parser.add_argument("--upload_checkpoints", action="store_true", help="Upload checkpoints to HF Hub after training")
     args = parser.parse_args()
+
+    # DDP: pin this process to its GPU. torchrun sets LOCAL_RANK/WORLD_SIZE;
+    # single-process runs leave them unset (rank 0, world 1).
+    try:
+        _ddp_local_rank = int(os.environ.get("LOCAL_RANK", str(args.local_rank if args.local_rank >= 0 else 0)))
+        _ddp_world = int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        _ddp_local_rank, _ddp_world = 0, 1
+    if _ddp_world > 1 and torch.cuda.is_available():
+        torch.cuda.set_device(_ddp_local_rank % max(torch.cuda.device_count(), 1))
+        print(f"[DDP] rank {os.environ.get('RANK', _ddp_local_rank)}/{_ddp_world} pinned to cuda:{torch.cuda.current_device()}", flush=True)
 
     if args.entropy_beta is not None:
         args.entropy_coef = args.entropy_beta
@@ -2754,7 +2771,7 @@ def main():
         login_to_hf(args.hf_token)
 
     # Pre-training sync: upload any locally existing checkpoints that are missing on HF.
-    if args.upload_checkpoints and args.hf_repo_id:
+    if args.upload_checkpoints and args.hf_repo_id and is_main_process():
         sync_missing_local_to_hf(args.output_dir, args.hf_repo_id, hf_token=args.hf_token, include_best=True, hf_path_prefix=hf_path_prefix)
 
     resume_checkpoint = None
@@ -3177,7 +3194,8 @@ def main():
             eval_model.config.decoder_start_token_id = fallback
             print(f"Set decoder_start_token_id = {fallback} (from decoder.bos_token_id)")
     eval_model_dtype = get_model_float_dtype(eval_model)
-    eval_model.to("cuda")
+    _eval_dev = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+    eval_model.to(_eval_dev)
     eval_model.eval()
     eval_model.config.use_cache = True
     if is_main_process():
