@@ -52,6 +52,23 @@ def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
                         collate_fn=collator)
     preds, golds, dbs, gold_answers, inputs = [], [], [], [], []
     model.eval()
+    # checkpointing is backward-only machinery; under inference_mode it only
+    # forces use_cache=False (O(n^2) decode). Disable for the loop.
+    had_ckpt = False
+    try:
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+            had_ckpt = True
+    except Exception:
+        had_ckpt = False
+    try:
+        _use_cache = model.config.use_cache
+    except Exception:
+        _use_cache = None
+    try:
+        model.config.use_cache = True
+    except Exception:
+        pass
     with torch.inference_mode():
         for batch in tqdm(loader, desc=f"Evaluating ({label})"):
             input_ids = batch["input_ids"].to(device)
@@ -67,6 +84,14 @@ def run_generation_eval(model, dataset, tokenizer, collator, max_target_length,
             gold_answers.extend(batch.get("gold_answer", [None] * n))
             inputs.extend(batch.get("input_text", [None] * n))
             del input_ids, attention_mask, generated
+
+    try:
+        if _use_cache is not None:
+            model.config.use_cache = _use_cache
+        if had_ckpt and hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+    except Exception:
+        pass
 
     max_len = max(t.shape[1] for t in preds)
     P = torch.cat([torch.nn.functional.pad(t, (0, max_len - t.shape[1]),

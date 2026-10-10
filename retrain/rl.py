@@ -222,7 +222,24 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         from .rewards import compute_reward
 
+        import time as _t0
         cfg = self.cfg
+        now = _t0.perf_counter()
+        gs = int(self.state.global_step)
+        if gs != getattr(self, "_micro_step", -1):
+            self._micro_step = gs
+            self._micro_i = 0
+        self._micro_i = getattr(self, "_micro_i", 0) + 1
+        last_dt = now - getattr(self, "_micro_t", now)
+        self._micro_t = now
+        try:
+            _tok = int(inputs["input_ids"].numel())
+            _n = int(inputs["input_ids"].shape[0])
+        except Exception:
+            _tok, _n = -1, -1
+        _acc = int(getattr(self.args, "gradient_accumulation_steps", 0) or 0)
+        print(f"  [micro {self._micro_i}/{_acc if _acc else '?'}] step={gs} "
+              f"n={_n} tok={_tok} last={last_dt:.1f}s", flush=True)
         model_t = model.module if hasattr(model, "module") else model
         labels = inputs["labels"]
         self._rl_counter += 1
@@ -327,7 +344,8 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                 print(f"  [GRPO] step={self.state.global_step} G={G} temps={temps} "
                       f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale} "
                       f"norepeat={cfg.train_no_repeat_ngram_size} "
-                      f"reppen={cfg.train_repetition_penalty} ({batched})", flush=True)
+                      f"reppen={cfg.train_repetition_penalty} gen_len={gen_len} ({batched})",
+                      flush=True)
         gc.collect()
         max_len = max(t.shape[1] for t in gen_batches)
         gen_ids = torch.cat(
