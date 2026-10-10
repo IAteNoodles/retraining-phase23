@@ -239,6 +239,16 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         if not do_rl or self.state.global_step < cfg.rl_warmup_steps:
             return (ce_loss, None) if return_outputs else ce_loss
 
+        # Free the CE graph BEFORE generation (not after section 4): grad of
+        # a sum is the sum of grads, so ce.backward() now + returning the
+        # rl-only loss is EXACT — and ~1.5-3GB of [seq x 262k] CE tensors
+        # never coexists with generation KV cache + candidate tensors.
+        # (Placed after section 4 originally: still OOMed. Order matters.)
+        ce_value = float(ce_loss.detach().item())
+        if cfg.sft_coef != 0:
+            (cfg.sft_coef * ce_loss).backward()
+        del ce_loss
+
         pad_id = self.tokenizer.pad_token_id
         batch_size = inputs["input_ids"].shape[0]
         G = cfg.rl_candidates
@@ -397,13 +407,16 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                    + cfg.consistency_coef * cons)
 
         # circuit breaker: if NO candidate has a valid gold execution, the
-        # rewards are pure shaping noise - skip RL, keep SFT only
+        # rewards are pure shaping noise - skip RL, keep SFT only.
+        # (ce grads are already in .grad from the pre-generation backward,
+        # so return a zero graph: returning ce again would count it twice.)
         if all(b == "gold_exec_fail" for b in branches):
             print(f"  [RL_SKIP] step={self.state.global_step}: all gold executions "
                   f"failed (check Neo4j URL/auth/mapping) - SFT loss only", flush=True)
             del gen_ids
             gc.collect()
-            return (ce_loss, None) if return_outputs else ce_loss
+            zero = torch.tensor(0.0, device=inputs["input_ids"].device)
+            return (zero, None) if return_outputs else zero
 
         # ── 2b. log EVERY generation: candidate text, reward parts, group stats ──
         if cfg.rolling_jsonl_path:
@@ -507,21 +520,15 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         else:
             kl = torch.tensor(0.0, device=grpo_loss.device)
 
-        total = cfg.sft_coef * ce_loss + cfg.rl_coef * grpo_loss
-        # ── 4b. sequence the backwards: run ce.backward() HERE, return the
-        # rl-only loss for Trainer's backward. grad(total) = grad(ce)+grad(rl)
-        # so the update is EXACT — while peak VRAM drops ~2x (no two
-        # [seq x 262k] graphs alive at once). This was the step-0 killer:
-        # CE logits+softmax AND candidate logits+softmax coexisted (~4GB).
-        ce_part = cfg.sft_coef * ce_loss
-        ce_part.backward()
-        rl_part = torch.nan_to_num(cfg.rl_coef * grpo_loss, nan=0.0,
-                                   posinf=0.0, neginf=0.0)
-        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+        total = cfg.rl_coef * grpo_loss
+        # (ce grads are already in .grad from the pre-generation backward;
+        # returning anything containing ce would count it twice.)
+        rl_part = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+        total = rl_part + cfg.sft_coef * ce_value
         import time as _t2
         t_end = _t2.perf_counter()
         print(f"  [GRPO_LOSS] grpo={grpo_loss.item():.4f} ent={ent.item():.4f} "
-              f"kl={kl.item():.4f} ce={ce_loss.item():.4f} total={total.item():.4f} "
+              f"kl={kl.item():.4f} ce={ce_value:.4f} total={total:.4f} "
               f"mean_r={rewards.mean():.3f}", flush=True)
         print(f"  [GRPO_TIME] step={self.state.global_step} "
               f"gen={t_gen_done - t_rl0:.1f}s reward={t_reward_done - t_gen_done:.1f}s "
