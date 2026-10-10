@@ -151,6 +151,8 @@ def run_phase(cfg: RunConfig) -> str:
               "final adapter will be saved as 'final'")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
+    if not cfg.rolling_jsonl_path:
+        cfg.rolling_jsonl_path = os.path.join(cfg.output_dir, "rolling_data.jsonl")
     neo4j = build_neo4j(cfg) if cfg.neo4j_url else None
     if cfg.use_rl and neo4j is None:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
