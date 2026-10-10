@@ -113,7 +113,6 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         r = compute_reward(cand, gold, self.neo4j_client, database=db)
         em = 1.0 if cand == gold else 0.0
         return r, em, simplicity(cand, gold)
-
     def _candidate_temperature(self, c: int, total_steps: int) -> float:
         cfg = self.cfg
         if total_steps > 0:
@@ -271,10 +270,13 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         t_reward_done = _time.perf_counter()
 
         base_r, exec_sets, simps = [], [], []
+        branches, raw_jac = [], []
         for i in range(batch_size):
             for c in range(G):
                 r, em, s_ = results[(i, c)]
                 base_r.append(r["jaccard"] + cfg.exact_match_weight * em)
+                raw_jac.append(r["jaccard"])
+                branches.append(r.get("branch", "?"))
                 try:
                     exec_sets.append(r.get("exec_set"))
                 except Exception:
@@ -322,6 +324,21 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         adv_t = torch.tensor(adv.reshape(-1), device=inputs["input_ids"].device,
                              dtype=torch.float32)
         self.reward_ema = 0.9 * self.reward_ema + 0.1 * float(rewards.mean())
+
+        # ── 3b. console scoreboard: every candidate, every score, every step ──
+        _rj = np.array(raw_jac, dtype=np.float64).reshape(batch_size, G)
+        _br = np.array(branches, dtype=object).reshape(batch_size, G)
+        _sp = np.array(simps, dtype=np.float64).reshape(batch_size, G)
+        print(f"  [GRPO_SCORES] step={self.state.global_step}", flush=True)
+        for i in range(batch_size):
+            print(f"    prompt{i}: "
+                  f"jac=[{','.join(f'{x:.2f}' for x in _rj[i])}] "
+                  f"div=[{','.join(f'{x:.2f}' for x in divs[i])}] "
+                  f"simp=[{','.join(f'{x:.2f}' for x in _sp[i])}] "
+                  f"cons=[{','.join(f'{x:.0f}' for x in cons[i])}] "
+                  f"tot=[{','.join(f'{x:.2f}' for x in rewards[i])}] "
+                  f"adv=[{','.join(f'{x:+.2f}' for x in adv[i])}] "
+                  f"branch=[{','.join(str(x) for x in _br[i])}]", flush=True)
 
         # ── 4. policy gradient on group candidates, in chunks ──
         # A full G×B stacked forward blows VRAM (logits over 262K vocab);
