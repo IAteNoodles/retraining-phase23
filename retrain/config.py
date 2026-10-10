@@ -221,6 +221,9 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     d["use_quant"] = not getattr(args, "no_quant", False)
     d["fp16"] = bool(getattr(args, "fp16", True))
     cfg = RunConfig(**d)
+    # precision precedence: explicit bf16 wins over fp16 (mutually exclusive in HF)
+    if cfg.bf16:
+        cfg.fp16 = False
     # v1 aliases (old train.py accepted both names)
     if getattr(args, "entropy_beta", None) is not None:
         cfg.entropy_coef = args.entropy_beta
