@@ -13,6 +13,11 @@ import sys
 # must be set before CUDA initializes (reduces fragmentation OOMs on 6 GB cards)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# huggingface_hub deprecated HF_HUB_ENABLE_HF_TRANSFER; map it to the
+# replacement so users with the old var set don't get a warning traceback
+if os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None) is not None:
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from retrain.config import build_parser, config_from_args

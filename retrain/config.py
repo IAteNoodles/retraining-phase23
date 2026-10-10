@@ -52,7 +52,8 @@ class RunConfig:
                                        # steps need smaller micros
     target_step_tokens: int = 55000
     max_input_length: int = 1536
-    max_target_length: int = 320
+    max_target_length: int = 1024  # generation/eval cap: covers target p100
+    rl_max_new_tokens: int = 320   # RL candidates stay short (VRAM); eval uses max_target_length
     weight_decay: float = 0.01
     label_smoothing: float = 0.0
     neftune_noise_alpha: float = 5.0
@@ -78,7 +79,6 @@ class RunConfig:
     rl_coef: float = 0.3
     rl_candidates: int = 4          # GRPO group size G (>= 2)
     rl_chunk_size: int = 2          # candidates per forward slice (VRAM bound)
-    rl_max_new_tokens: int = 0      # cap RL generation length (0 = max_target_length)
     rl_every_n_steps: int = 2
     rl_warmup_steps: int = 50
     reward_ema_alpha: float = 0.1   # logging EMA only; baseline is group mean
@@ -155,8 +155,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--rl_micro_target_tokens", type=int, default=350)
         sp.add_argument("--target_step_tokens", type=int, default=55000)
         sp.add_argument("--max_input_length", type=int, default=1536)
-        sp.add_argument("--max_target_length", type=int, default=320,
-                        help="Generation/eval output cap. Training targets are NEVER truncated.")
+        sp.add_argument("--max_target_length", type=int, default=1024,
+                        help="Generation/eval output cap (covers target p100). "
+                             "Training targets are NEVER truncated.")
         sp.add_argument("--weight_decay", type=float, default=0.01)
         sp.add_argument("--label_smoothing", type=float, default=0.0)
         sp.add_argument("--neftune_noise_alpha", type=float, default=5.0)

@@ -31,10 +31,12 @@ def resolve_model(path: str, token: str = "") -> str:
         return path
     from huggingface_hub import snapshot_download
     if path.startswith("hf://"):
-        rest = path[len("hf://"):]
-        repo_id, _, subpath = rest.partition("/")
-        if not repo_id or not subpath:
-            raise ValueError(f"bad model spec (want hf://repo/subpath): {path!r}")
+        rest = path[len("hf://"):].strip("/")
+        parts = rest.split("/")
+        if len(parts) < 3:
+            raise ValueError(f"bad model spec (want hf://owner/repo/subpath): {path!r}")
+        repo_id = "/".join(parts[:2])
+        subpath = "/".join(parts[2:])
         dest = os.path.join("models", (repo_id + "__" + subpath).replace("/", "__"))
         if not os.path.exists(os.path.join(dest, "config.json")):
             print(f"downloading {repo_id}/{subpath} -> {dest}")
