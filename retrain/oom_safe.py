@@ -54,13 +54,26 @@ class OOMSafeMixin:
     oom_min_tokens = 1000
     oom_min_target_tokens = 200
 
-    def _record_skipped(self, inputs):
+    def _record_skipped(self, inputs, step=None, err=""):
         try:
-            idx = inputs.get("index", "?")
+            def _len(x):
+                try:
+                    return int(x.shape[-1]) if torch.is_tensor(x) else len(x)
+                except Exception:
+                    return -1
+            rec = {
+                "step": step if step is not None else getattr(
+                    getattr(self, "state", None), "global_step", "?"),
+                "index": str(inputs.get("index", "?")),
+                "database": str(inputs.get("database", "?")),
+                "input_tokens": _len(inputs.get("input_ids")),
+                "target_tokens": _len(inputs.get("labels")),
+                "error": str(err)[:300],
+            }
             path = os.path.join(self.args.output_dir, "skipped_oom.jsonl")
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"index": str(idx)}) + "\n")
+                f.write(json.dumps(rec) + "\n")
         except Exception:
             pass
 
@@ -82,6 +95,7 @@ class OOMSafeMixin:
         except RuntimeError as e:
             if "out of memory" not in str(e).lower():
                 raise
+            err = str(e)[:300]  # `e` is deleted after the block; keep the text
         # --- OOM path ---
         step = getattr(getattr(self, "state", None), "global_step", "?")
         torch.cuda.empty_cache()
@@ -89,7 +103,7 @@ class OOMSafeMixin:
         self._shrink_budgets()
         halves = _split_inputs(inputs)
         if not halves:
-            self._record_skipped(inputs)
+            self._record_skipped(inputs, step, err)
             print(f"  [oom-redo] step={step}: single sample still OOMs - logged + skipped",
                   flush=True)
             dev = model.device if hasattr(model, "device") else "cuda"
