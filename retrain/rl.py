@@ -148,8 +148,12 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
 
     def _prepare_inputs(self, inputs):
         if isinstance(inputs, dict):
-            self._ctx = {k: inputs.pop(k, None)
-                         for k in ("gold_answer", "database", "input_text")}
+            # only overwrite keys actually present: oom-redo retries run on
+            # split halves that lack the aux lists, and must NOT clobber _ctx
+            # (else rewards score with input_text=None: schema=0, entity hurt)
+            for k in ("gold_answer", "database", "input_text"):
+                if k in inputs:
+                    self._ctx[k] = inputs.pop(k)
         return super()._prepare_inputs(inputs)
 
     def _reward_one(self, cfg, task):
@@ -458,7 +462,10 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
             log_probs = F.log_softmax(outputs2.logits, dim=-1)
             token_lp = log_probs.gather(2, tgt_slice.unsqueeze(-1)).squeeze(-1)
             pmask = (tgt_slice != pad_id).float()
-            seq_lp = (token_lp * pmask).sum(dim=-1)
+            # per-token MEAN, not sum: a runaway 1k-token candidate must not
+            # outweigh a crisp 50-token one 20:1 (that gave grpo=±2000).
+            seq_lp = ((token_lp * pmask).sum(dim=-1)
+                      / pmask.sum(dim=-1).clamp_min(1.0))
             acc_rl = acc_rl + (seq_lp * adv_slice).sum() / n_all
             if need_ent or need_kl:
                 probs = log_probs.detach().exp()
@@ -493,6 +500,15 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
             kl = torch.tensor(0.0, device=grpo_loss.device)
 
         total = cfg.sft_coef * ce_loss + cfg.rl_coef * grpo_loss
+        # ── 4b. sequence the backwards: run ce.backward() HERE, return the
+        # rl-only loss for Trainer's backward. grad(total) = grad(ce)+grad(rl)
+        # so the update is EXACT — while peak VRAM drops ~2x (no two
+        # [seq x 262k] graphs alive at once). This was the step-0 killer:
+        # CE logits+softmax AND candidate logits+softmax coexisted (~4GB).
+        ce_part = cfg.sft_coef * ce_loss
+        ce_part.backward()
+        rl_part = torch.nan_to_num(cfg.rl_coef * grpo_loss, nan=0.0,
+                                   posinf=0.0, neginf=0.0)
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
         import time as _t2
         t_end = _t2.perf_counter()
@@ -502,4 +518,6 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         print(f"  [GRPO_TIME] step={self.state.global_step} "
               f"gen={t_gen_done - t_rl0:.1f}s reward={t_reward_done - t_gen_done:.1f}s "
               f"backward={(t_end - t_reward_done):.1f}s", flush=True)
-        return (total, None) if return_outputs else total
+        # return the RL part only: ce grads are already in .grad (returning
+        # `total` would count ce twice).
+        return (rl_part, None) if return_outputs else rl_part
