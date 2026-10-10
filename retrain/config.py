@@ -95,7 +95,7 @@ class RunConfig:
     exact_match_weight: float = 0.3
     sft_coef: float = 1.0
     diversity_coef: float = 0.1     # 1 - mean pairwise bigram overlap
-    simplicity_coef: float = 0.05   # -(length drift + bracket mismatch)
+    simplicity_coef: float = 0.15   # -(length error + 3x repetition + brackets)
     consistency_coef: float = 0.1   # 1 if result == group majority else 0
 
     # early stopping + diagnostics

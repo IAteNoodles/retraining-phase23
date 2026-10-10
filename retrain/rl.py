@@ -52,12 +52,23 @@ def pairwise_dissimilarity(texts: list[str]) -> list[float]:
     return out
 
 
+def repetition(text: str) -> float:
+    """0 = no repeat .. ~1 = degenerate loop. 1 - unique/total bigram ratio."""
+    toks = text.split()
+    if len(toks) < 8:
+        return 0.0
+    bi = list(zip(toks, toks[1:]))
+    return 1.0 - len(set(bi)) / len(bi)
+
+
 def simplicity(text: str, gold: str) -> float:
-    """<= 0. Compares length and bracket balance against gold."""
+    """<= 0. Punishes hard: relative length error vs gold, bigram repetition
+    loops, and bracket imbalance."""
     lp, lg = len(text.split()), max(len(gold.split()), 1)
-    drift = abs(lp / lg - 1.0)
+    drift = abs(lp - lg) / lg
+    rep = repetition(text)
     brackets = abs(text.count("(") - text.count(")")) + abs(text.count("{") - text.count("}"))
-    return -(drift + 0.5 * brackets)
+    return -(drift + 3.0 * rep + 0.5 * brackets)
 
 
 class _ClampLogits(LogitsProcessor):

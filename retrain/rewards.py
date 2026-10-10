@@ -58,7 +58,9 @@ def compute_reward(pred_cypher: str, gold_cypher: str, neo4j_client,
 
     pred_rows = neo4j_client.execute(pred, database=database)
     exec_ok = pred_rows is not None
-    jac = result_jaccard(gold_rows, pred_rows if exec_ok else [])
+    # A failed execution NEVER matches - even when gold is legitimately empty
+    # (otherwise broken queries score perfect on empty golds: reward hacking).
+    jac = result_jaccard(gold_rows, pred_rows) if exec_ok else 0.0
 
     exact = normalize_cypher(pred) == normalize_cypher(gold)
     if exact and (exec_ok or not gold_rows):
