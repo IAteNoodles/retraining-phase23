@@ -24,15 +24,34 @@ from .sft import run_sft
 
 
 def resolve_model(path: str, token: str = "") -> str:
-    """Local dir wins; otherwise treated as a HuggingFace repo id and
-    snapshot-downloaded (cached under ./models/)."""
+    """Local dir wins; otherwise treated as a HuggingFace repo id (whole repo)
+    or hf://repo/subpath (subdirectory only), snapshot-downloaded and cached
+    under ./models/."""
     if path and os.path.isdir(path):
         return path
+    from huggingface_hub import snapshot_download
+    if path.startswith("hf://"):
+        rest = path[len("hf://"):]
+        repo_id, _, subpath = rest.partition("/")
+        if not repo_id or not subpath:
+            raise ValueError(f"bad model spec (want hf://repo/subpath): {path!r}")
+        dest = os.path.join("models", (repo_id + "__" + subpath).replace("/", "__"))
+        if not os.path.exists(os.path.join(dest, "config.json")):
+            print(f"downloading {repo_id}/{subpath} -> {dest}")
+            snapshot_download(repo_id=repo_id, repo_type="model",
+                              allow_patterns=[subpath.rstrip("/") + "/*"],
+                              local_dir=dest, local_dir_use_symlinks=False,
+                              token=token or None)
+        else:
+            print(f"reusing cached model: {dest}")
+        out = os.path.join(dest, subpath)
+        if not os.path.isdir(out):
+            raise FileNotFoundError(f"downloaded model missing: {out!r}")
+        return out
     if not path or "/" not in path:
         raise FileNotFoundError(
-            f"model not found locally: {path!r} - pass a local dir or a "
-            f"Hub id like 'org/model'")
-    from huggingface_hub import snapshot_download
+            f"model not found locally: {path!r} - pass a local dir, a Hub id "
+            f"like 'org/model', or hf://repo/subpath")
     dest = os.path.join("models", path.replace("/", "__"))
     if not os.path.exists(os.path.join(dest, "config.json")):
         print(f"downloading base model {path} -> {dest}")
