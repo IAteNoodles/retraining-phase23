@@ -2,7 +2,7 @@
 testing, so numbers are comparable.
 
 Every execution is routed to the row's own database (never a global default),
-and execution metrics are honest Jaccard statistics, not raw-reward averages:
+and execution metrics are honest Jaccard statistics, never raw-reward averages:
   execution_accuracy = fraction of samples with result-Jaccard >= threshold
   mean_result_jaccard = mean over samples of the Jaccard itself
 """
@@ -15,8 +15,9 @@ from collections import Counter
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+from transformers import TrainerCallback
 
 from .rewards import normalize_cypher, result_jaccard
 
@@ -170,3 +171,79 @@ def append_rolling_records(path, max_records, phase_name, label,
             json.dump([json.loads(x) for x in lines[-max_records:]], f, indent=1)
     except Exception:
         pass
+
+
+class ExecBestCallback(TrainerCallback):
+    """Best-model selection SOLELY on execution accuracy.
+
+    At every in-training eval, runs generation eval on a FIXED val subset
+    (same indices each time, so scores are comparable) and keeps the adapter
+    with the highest execution_accuracy (ties broken by mean_result_jaccard).
+    Requires a Neo4j client; without one it stays inert.
+    """
+
+    def __init__(self, tokenizer, val_dataset, collator, out_dir: str,
+                 neo4j_client=None, exec_samples: int = 100,
+                 threshold: float = 0.85, max_target_length: int = 320,
+                 eval_batch_size: int = 2, seed: int = 42,
+                 upload_repo: str = "", upload_token: str = "",
+                 upload_prefix: str = "", phase_name: str = ""):
+        self.tokenizer = tokenizer
+        self.collator = collator
+        self.best_dir = os.path.join(out_dir, "best_exec")
+        self.neo4j_client = neo4j_client
+        self.threshold = threshold
+        self.max_target_length = max_target_length
+        self.eval_batch_size = eval_batch_size
+        self.upload_repo = upload_repo
+        self.upload_token = upload_token
+        self.upload_prefix = upload_prefix.strip("/") if upload_prefix else ""
+        self.phase_name = phase_name
+        n = len(val_dataset)
+        k = min(exec_samples, n) if exec_samples > 0 else n
+        rng = np.random.default_rng(seed)
+        self.subset_idx = sorted(rng.choice(n, size=k, replace=False).tolist())
+        self.subset = Subset(val_dataset, self.subset_idx)
+        self.best_acc = None
+        self.best_jac = None
+        self.trainer_ref = None
+
+    def _score(self, metrics: dict):
+        return (metrics.get("execution_accuracy", 0.0),
+                metrics.get("mean_result_jaccard", 0.0))
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if self.neo4j_client is None:
+            return
+        trainer = self.trainer_ref or kwargs.get("trainer")
+        if trainer is None:
+            return
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(self.best_dir)),
+                               "exec_eval_tmp")
+        m = run_generation_eval(
+            trainer.model, self.subset, self.tokenizer, self.collator,
+            self.max_target_length, os.path.join(out_dir, "metrics.json"),
+            label=f"exec@{state.global_step}", eval_batch_size=self.eval_batch_size,
+            neo4j_client=self.neo4j_client, exec_jaccard_threshold=self.threshold,
+            phase_name=self.phase_name)
+        if not m:
+            return
+        acc, jac = self._score(m)
+        better = (self.best_acc is None or acc > self.best_acc
+                  or (acc == self.best_acc and jac > (self.best_jac or 0.0)))
+        print(f"  [exec-best] step={state.global_step} acc={acc:.4f} "
+              f"mean_jac={jac:.4f} best={self.best_acc}", flush=True)
+        if better:
+            self.best_acc, self.best_jac = acc, jac
+            os.makedirs(self.best_dir, exist_ok=True)
+            trainer.save_model(self.best_dir)
+            print(f"  [exec-best] NEW BEST -> {self.best_dir}", flush=True)
+            if self.upload_repo:
+                try:
+                    from .sync import upload_dir
+                    path = ((self.upload_prefix + "/best_exec").strip("/")
+                            if self.upload_prefix else "best_exec")
+                    upload_dir(self.best_dir, self.upload_repo, path,
+                               token=self.upload_token)
+                except Exception as e:
+                    print(f"  [exec-best] hub upload failed (continuing): {e}", flush=True)

@@ -149,13 +149,13 @@ def run_phase(cfg: RunConfig) -> str:
               "final adapter will be saved as 'final'")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
-    neo4j = build_neo4j(cfg) if cfg.use_rl else None
+    neo4j = build_neo4j(cfg) if cfg.neo4j_url else None
     if cfg.use_rl and neo4j is None:
         raise ValueError("--use_rl requires --neo4j_url (reward backend)")
     kl_ref = None
     if cfg.use_rl and cfg.kl_coef > 0:
         from transformers import AutoModelForSeq2SeqLM as _AM, BitsAndBytesConfig as _BNB
-        kl_path = cfg.kl_ref_model_path or cfg.model_path
+        kl_path = resolve_model(cfg.kl_ref_model_path or cfg.model_path, cfg.hf_token)
         print(f"loading frozen KL reference (4-bit, same as policy): {kl_path}")
         _bnb = _BNB(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                     bnb_4bit_compute_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
@@ -172,6 +172,11 @@ def run_phase(cfg: RunConfig) -> str:
     if neo4j is not None:
         neo4j.close()
     del kl_ref
+    if cfg.upload_checkpoints and cfg.hf_repo_id:
+        from .sync import upload_dir
+        prefix = (cfg.hf_path_prefix.strip("/") + "/") if cfg.hf_path_prefix else ""
+        upload_dir(cfg.output_dir, cfg.hf_repo_id,
+                   f"{prefix}phase_{cfg.phase}", token=cfg.hf_token)
     print(f"=== phase {cfg.phase} done; best adapter: {best_dir} ===")
     return best_dir
 
@@ -223,3 +228,8 @@ def run_eval(cfg: RunConfig, model_dir: str):
                             phase_name=f"phase{cfg.phase}")
     if neo4j is not None:
         neo4j.close()
+    if cfg.upload_checkpoints and cfg.hf_repo_id:
+        from .sync import upload_dir
+        prefix = (cfg.hf_path_prefix.strip("/") + "/") if cfg.hf_path_prefix else ""
+        upload_dir(out_dir, cfg.hf_repo_id,
+                   f"{prefix}phase_{cfg.phase}_eval", token=cfg.hf_token)

@@ -62,6 +62,7 @@ class RunConfig:
     # eval / metrics
     eval_with_generate: bool = True
     eval_samples: int = 500
+    exec_eval_samples: int = 100  # fixed val subset for execution-based best tracking (needs Neo4j)
     exec_jaccard_threshold: float = 0.85
     best_metric: str = "eval_execution_accuracy"  # or eval_loss / eval_exact_match
 
@@ -163,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--eval_steps", type=int, default=200)
         sp.add_argument("--eval_with_generate", action=argparse.BooleanOptionalAction, default=True)
         sp.add_argument("--eval_samples", type=int, default=500)
+        sp.add_argument("--exec_eval_samples", type=int, default=100)
         sp.add_argument("--exec_jaccard_threshold", type=float, default=0.85)
         sp.add_argument("--best_metric", type=str, default="eval_execution_accuracy")
         sp.add_argument("--neo4j_url", type=str, default="")

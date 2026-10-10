@@ -64,15 +64,21 @@ class BestAdapterTracker(TrainerCallback):
 
     Falls back to eval_loss (the only metric HF always computes in-loop);
     execution-based selection belongs to post-training run_eval.
+    With upload configured, pushes best_dir to the Hub on every improvement.
     """
 
-    def __init__(self, metric: str, greater_is_better: bool, best_dir: str):
+    def __init__(self, metric: str, greater_is_better: bool, best_dir: str,
+                 upload_repo: str = "", upload_token: str = "",
+                 upload_prefix: str = ""):
         self.metric = metric
         self.greater_is_better = greater_is_better
         self.best_dir = best_dir
         self.best_value = None
         self.trainer_ref = None  # set by build_trainer (HF does not pass it)
         self._fell_back = False
+        self.upload_repo = upload_repo
+        self.upload_token = upload_token
+        self.upload_prefix = upload_prefix.strip("/") if upload_prefix else ""
 
     def _is_better(self, value: float) -> bool:
         if self.best_value is None:
@@ -99,6 +105,13 @@ class BestAdapterTracker(TrainerCallback):
                 os.makedirs(self.best_dir, exist_ok=True)
                 self.trainer_ref.save_model(self.best_dir)
                 print(f"  [best] {self.metric}={value:.4f} -> saved to {self.best_dir}", flush=True)
+            if self.upload_repo:
+                try:
+                    from .sync import upload_dir
+                    path = (self.upload_prefix + "/best").strip("/") if self.upload_prefix else "best"
+                    upload_dir(self.best_dir, self.upload_repo, path, token=self.upload_token)
+                except Exception as e:
+                    print(f"  [best] hub upload failed (continuing): {e}", flush=True)
 
 
 def _metric_direction(best_metric: str) -> tuple[str, bool]:
@@ -115,7 +128,10 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
 
     metric, greater = _metric_direction(cfg.best_metric)
     best_dir = os.path.join(out_dir, "best")
-    tracker = BestAdapterTracker(metric, greater, best_dir)
+    tracker = BestAdapterTracker(metric, greater, best_dir,
+                                 upload_repo=cfg.hf_repo_id if cfg.upload_checkpoints else "",
+                                 upload_token=cfg.hf_token,
+                                 upload_prefix=cfg.hf_path_prefix)
 
     # token-budget batching: micro-batches packed to max_tokens AND
     # max_target_tokens; accumulation measured so each optimizer step sees
@@ -166,8 +182,8 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
         eval_steps=cfg.eval_steps,
         save_strategy="steps",
         save_steps=cfg.save_steps,
-        save_total_limit=3,
-        load_best_model_at_end=False,   # PEFT-incompatible; BestAdapterTracker handles it
+        save_total_limit=None,   # keep ALL checkpoints (explicit user requirement)
+        load_best_model_at_end=False,   # PEFT-incompatible; trackers handle it
         # NOTE: HF requires this metric to exist in-loop; only eval_loss always
         # does (we compute no in-loop metrics). BestAdapterTracker falls back
         # to it independently; execution-based selection is a run_eval decision.
@@ -199,6 +215,20 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
                 callbacks=[tracker])
     if cfg.min_epochs > 0 and val_dataset is not None:
         base["callbacks"].append(MinEpochEarlyStopping(metric, greater, min_epochs=cfg.min_epochs))
+    exec_tracker = None
+    neo4j_client = rl_kwargs.get("neo4j_client")
+    if (neo4j_client is not None and val_dataset is not None
+            and getattr(cfg, "exec_eval_samples", 0) != 0):
+        from .evaluate import ExecBestCallback
+        exec_tracker = ExecBestCallback(
+            tokenizer, val_dataset, collator, out_dir,
+            neo4j_client=neo4j_client, exec_samples=cfg.exec_eval_samples,
+            threshold=cfg.exec_jaccard_threshold, max_target_length=cfg.max_target_length,
+            eval_batch_size=cfg.eval_batch_size or cfg.batch_size, seed=cfg.seed,
+            upload_repo=cfg.hf_repo_id if cfg.upload_checkpoints else "",
+            upload_token=cfg.hf_token, upload_prefix=cfg.hf_path_prefix,
+            phase_name=f"phase{cfg.phase}")
+        base["callbacks"].append(exec_tracker)
     if use_rl:
         trainer = GRPOTrainer(tokenizer=tokenizer, cfg=cfg, **rl_kwargs, **base)
     else:
@@ -215,6 +245,8 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
 
         trainer = _SFT(**base)
     tracker.trainer_ref = trainer
+    if exec_tracker is not None:
+        exec_tracker.trainer_ref = trainer
     trainer.bucket_cfg = bucket_cfg
     return trainer, tracker
 
