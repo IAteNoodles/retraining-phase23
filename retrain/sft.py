@@ -195,7 +195,9 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
     else:
         from transformers import Seq2SeqTrainer as _T
 
-        class _SFT(BucketDataloaderMixin, _T):
+        from .oom_safe import OOMSafeMixin
+
+        class _SFT(BucketDataloaderMixin, OOMSafeMixin, _T):
             def _prepare_inputs(self, inputs):
                 if isinstance(inputs, dict):
                     for k in ("gold_answer", "database", "input_text", "index"):

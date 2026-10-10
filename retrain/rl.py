@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from transformers import LogitsProcessor, LogitsProcessorList, Seq2SeqTrainer
 
 from .batching import BucketDataloaderMixin
+from .oom_safe import OOMSafeMixin
 
 
 def _bigrams(text: str) -> set:
@@ -76,7 +77,7 @@ class _GaussianNoise(LogitsProcessor):
         return scores
 
 
-class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
+class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
     def __init__(self, *args, tokenizer=None, cfg=None, neo4j_client=None,
                  kl_ref_model=None, **kwargs):
         super().__init__(*args, **kwargs)
