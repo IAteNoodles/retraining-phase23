@@ -697,6 +697,26 @@ def ensure_trainable_params_fp32(model):
     return converted
 
 
+def unify_model_dtype(model, dtype, tag="model"):
+    """Force every floating param/buffer to one dtype.
+
+    from_pretrained(..., torch_dtype=X) leaves stray dtypes on sharded
+    checkpoints (measured: bf16+fp16 mix on merged_base). A mixed model
+    crashes bare forward (dtype mismatch) and NaNs under autocast.
+    NOTE: unifying does not change range physics — fp16 unified still
+    overflows this model; bf16 unified still needs bf16 kernels.
+    """
+    try:
+        dtypes = {p.dtype for p in model.parameters() if torch.is_floating_point(p)}
+    except Exception as e:
+        print(f"[DType] {tag}: dtype scan failed: {e}")
+        return model
+    if len(dtypes) > 1 or (dtypes and next(iter(dtypes)) != dtype):
+        model = model.to(dtype)
+        print(f"[DType] {tag}: unified {sorted(str(d) for d in dtypes)} -> {dtype}.")
+    return model
+
+
 def _sample_token_length(dataset, idx):
     try:
         item = dataset[idx]
@@ -2631,6 +2651,7 @@ def main():
             attn_implementation="sdpa",
             torch_dtype=model_dtype,
         )
+        model = unify_model_dtype(model, model_dtype, "train")
     
     if not hasattr(model.config, 'decoder_start_token_id') or model.config.decoder_start_token_id is None:
         fallback = getattr(getattr(model.config, "decoder", None), "bos_token_id", None)
@@ -2827,6 +2848,7 @@ def main():
                     merge_model = AutoModelForSeq2SeqLM.from_pretrained(
                         base_model_path, torch_dtype=model_dtype, attn_implementation="sdpa",
                     )
+                    merge_model = unify_model_dtype(merge_model, model_dtype, "merge-phase1")
                     if not hasattr(merge_model.config, 'decoder_start_token_id') or merge_model.config.decoder_start_token_id is None:
                         fallback = getattr(getattr(merge_model.config, "decoder", None), "bos_token_id", None)
                         if fallback is not None:
@@ -2947,6 +2969,7 @@ def main():
                         attn_implementation="sdpa",
                         torch_dtype=model_dtype,
                     ).to(model.device)
+                    kl_ref_model = unify_model_dtype(kl_ref_model, model_dtype, "kl-ref")
                     kl_ref_model.eval()
                     for param in kl_ref_model.parameters():
                         param.requires_grad_(False)
@@ -3113,6 +3136,7 @@ def main():
         merge_model = AutoModelForSeq2SeqLM.from_pretrained(
             base_model_path, torch_dtype=model_dtype, attn_implementation="sdpa",
         )
+        merge_model = unify_model_dtype(merge_model, model_dtype, "merge-eval")
         if not hasattr(merge_model.config, 'decoder_start_token_id') or merge_model.config.decoder_start_token_id is None:
             fallback = getattr(getattr(merge_model.config, "decoder", None), "bos_token_id", None)
             if fallback is not None:
