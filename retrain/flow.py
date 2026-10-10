@@ -172,6 +172,23 @@ def run_phase(cfg: RunConfig) -> str:
         kl_ref.eval()
         for p in kl_ref.parameters():
             p.requires_grad_(False)
+        # sanity: policy base weights and KL ref weights must match when they
+        # are supposed to be the same checkpoint - otherwise KL is meaningless
+        try:
+            base_sd = model.base_model.model.state_dict()
+            ref_sd = kl_ref.state_dict()
+            common = [k for k in base_sd if k in ref_sd][:8]
+            diffs = [(k, float((base_sd[k].float() - ref_sd[k].float()).abs().max()))
+                     for k in common]
+            worst = max(diffs, key=lambda x: x[1]) if diffs else ("?", float("nan"))
+            print(f"  [kl-check] compared {len(common)} tensors vs ref; "
+                  f"max abs diff {worst[1]:.4f} on {worst[0]}", flush=True)
+            if worst[1] > 0.05:
+                print("  [kl-check] WARNING: policy base and KL ref DIFFER - "
+                      "KL penalty is measuring checkpoint mismatch, not drift. "
+                      "Check --model_path vs --kl_ref_model_path.", flush=True)
+        except Exception as e:
+            print(f"  [kl-check] skipped ({e})", flush=True)
     best_dir = run_sft(model, tokenizer, train_ds, val_ds, cfg,
                        resume_checkpoint=cfg.resume_checkpoint,
                        use_rl=cfg.use_rl, neo4j_client=neo4j,
