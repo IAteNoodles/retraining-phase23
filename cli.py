@@ -10,6 +10,9 @@ Example local resume:
 import os
 import sys
 
+# must be set before CUDA initializes (reduces fragmentation OOMs on 6 GB cards)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from retrain.config import build_parser, config_from_args

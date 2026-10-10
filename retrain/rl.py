@@ -170,6 +170,11 @@ class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
         batch_size = inputs["input_ids"].shape[0]
         G = cfg.rl_candidates
         total_steps = getattr(self.args, "max_steps", 0) or 0
+        gen_len = cfg.rl_max_new_tokens or self.args.generation_max_length
+
+        # defragment before the memory-heavy section (generation + G× forward)
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # ── 1. sample a group of G candidates per prompt ──
         with torch.no_grad():
@@ -184,7 +189,7 @@ class GRPOTrainer(BucketDataloaderMixin, Seq2SeqTrainer):
                 g = model_t.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
-                    max_new_tokens=self.args.generation_max_length,
+                    max_new_tokens=gen_len,
                     do_sample=True, temperature=temp, top_k=cfg.train_top_k,
                     logits_processor=procs)
                 gen_batches.append(g)

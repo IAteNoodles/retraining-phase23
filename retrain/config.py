@@ -72,6 +72,7 @@ class RunConfig:
     rl_coef: float = 0.3
     rl_candidates: int = 4          # GRPO group size G (>= 2)
     rl_chunk_size: int = 2          # candidates per forward slice (VRAM bound)
+    rl_max_new_tokens: int = 0      # cap RL generation length (0 = max_target_length)
     rl_every_n_steps: int = 2
     rl_warmup_steps: int = 50
     reward_ema_alpha: float = 0.1   # logging EMA only; baseline is group mean
@@ -166,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--rl_coef", type=float, default=0.3)
     t.add_argument("--rl_candidates", type=int, default=4)
     t.add_argument("--rl_chunk_size", type=int, default=2)
+    t.add_argument("--rl_max_new_tokens", type=int, default=0)
     t.add_argument("--rl_every_n_steps", type=int, default=2)
     t.add_argument("--rl_warmup_steps", type=int, default=50)
     t.add_argument("--reward_ema_alpha", type=float, default=0.1)
