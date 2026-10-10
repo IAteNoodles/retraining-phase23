@@ -23,6 +23,26 @@ from .neo4j_client import Neo4jClient
 from .sft import run_sft
 
 
+def resolve_model(path: str, token: str = "") -> str:
+    """Local dir wins; otherwise treated as a HuggingFace repo id and
+    snapshot-downloaded (cached under ./models/)."""
+    if path and os.path.isdir(path):
+        return path
+    if not path or "/" not in path:
+        raise FileNotFoundError(
+            f"model not found locally: {path!r} - pass a local dir or a "
+            f"Hub id like 'org/model'")
+    from huggingface_hub import snapshot_download
+    dest = os.path.join("models", path.replace("/", "__"))
+    if not os.path.exists(os.path.join(dest, "config.json")):
+        print(f"downloading base model {path} -> {dest}")
+        snapshot_download(repo_id=path, local_dir=dest,
+                          local_dir_use_symlinks=False, token=token or None)
+    else:
+        print(f"reusing cached model: {dest}")
+    return dest
+
+
 def load_tokenizer(model_path: str):
     tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -78,6 +98,11 @@ def run_phase(cfg: RunConfig) -> str:
     print(f"  rows: {rep.split_counts} | ambiguous: {rep.ambiguous_counts} | "
           f"schema-miss: {rep.schema_miss}")
 
+    print("=== resolving base model (local dir or Hub download) ===")
+    cfg.model_path = resolve_model(cfg.model_path, cfg.hf_token)
+    if cfg.kl_ref_model_path:
+        cfg.kl_ref_model_path = resolve_model(cfg.kl_ref_model_path, cfg.hf_token)
+
     print("=== building model + data ===")
     tokenizer = load_tokenizer(cfg.model_path)
     model = build_model(cfg, tokenizer)
@@ -127,6 +152,7 @@ def run_phase(cfg: RunConfig) -> str:
 
 def run_eval(cfg: RunConfig, model_dir: str):
     from peft import PeftModel
+    cfg.model_path = resolve_model(cfg.model_path, cfg.hf_token)
     tokenizer = load_tokenizer(cfg.model_path)
     base = AutoModelForSeq2SeqLM.from_pretrained(
         cfg.model_path, local_files_only=True,
