@@ -178,12 +178,25 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
         gc.collect()
 
         # ── 1. sample a group of G candidates per prompt ──
+        # NOTE: gradient checkpointing is disabled around generation: it only
+        # saves memory for backward (irrelevant under no_grad) while forcing
+        # use_cache=False, i.e. every decoded token recomputes the full prefix
+        # (O(n^2) without KV cache). Disabling = pure speedup, zero downside.
+        had_ckpt = False
+        try:
+            if hasattr(model_t, "gradient_checkpointing_disable"):
+                model_t.gradient_checkpointing_disable()
+                had_ckpt = True
+        except Exception:
+            had_ckpt = False
         with torch.no_grad():
             model_t.config.use_cache = True
             gen_batches, temps = [], []
             for c in range(G):
                 temp = self._candidate_temperature(c, total_steps)
                 temps.append(round(temp, 3))
+            if G > 1 and len(set(temps)) == 1:
+                # uniform temperature: one batched call, G sequences per prompt
                 procs = LogitsProcessorList([_ClampLogits()])
                 if cfg.train_noise_scale > 0:
                     procs.append(_GaussianNoise(cfg.train_noise_scale))
@@ -191,13 +204,33 @@ class GRPOTrainer(BucketDataloaderMixin, OOMSafeMixin, Seq2SeqTrainer):
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
                     max_new_tokens=gen_len,
-                    do_sample=True, temperature=temp, top_k=cfg.train_top_k,
-                    logits_processor=procs)
-                gen_batches.append(g)
+                    do_sample=True, temperature=temps[0], top_k=cfg.train_top_k,
+                    num_return_sequences=G, logits_processor=procs)
+                B = inputs["input_ids"].shape[0]
+                g = g.view(B, G, -1).transpose(0, 1).reshape(B * G, -1)
+                gen_batches = [g[c * B:(c + 1) * B] for c in range(G)]
+            else:
+                for c in range(G):
+                    procs = LogitsProcessorList([_ClampLogits()])
+                    if cfg.train_noise_scale > 0:
+                        procs.append(_GaussianNoise(cfg.train_noise_scale))
+                    g = model_t.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        max_new_tokens=gen_len,
+                        do_sample=True, temperature=temps[c], top_k=cfg.train_top_k,
+                        logits_processor=procs)
+                    gen_batches.append(g)
             model_t.config.use_cache = False
+            if had_ckpt:
+                try:
+                    model_t.gradient_checkpointing_enable()
+                except Exception:
+                    pass
             if self.state.global_step % 20 == 0:
+                batched = "batched" if (G > 1 and len(set(temps)) == 1) else "sequential"
                 print(f"  [GRPO] step={self.state.global_step} G={G} temps={temps} "
-                      f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale}", flush=True)
+                      f"top_k={cfg.train_top_k} noise={cfg.train_noise_scale} ({batched})", flush=True)
         gc.collect()
         max_len = max(t.shape[1] for t in gen_batches)
         gen_ids = torch.cat(
