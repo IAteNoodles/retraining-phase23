@@ -2582,7 +2582,6 @@ def main():
     parser.add_argument("--compile_mode", type=str, default="default", help="torch.compile mode for --compile_model (default: 'default'; 'reduce-overhead' uses CUDAGraphs which cause partitioning with custom ops on T4)")
     parser.add_argument("--compile_eval", action="store_true", default=False, help="Compile merged eval model (can increase overhead for tiny eval sets)")
     parser.add_argument("--logging_steps", type=int, default=50, help="Log training metrics every N steps (default: 50)")
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log training metrics every N steps (default: 50)")
     parser.add_argument("--precision", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="Numeric precision policy for train/eval model loading")
     parser.add_argument("--hf_repo_id", type=str, default="", help="HuggingFace repo ID for uploading checkpoints (e.g., username/repo-name)")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace API token for uploading")
