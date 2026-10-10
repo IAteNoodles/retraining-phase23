@@ -44,9 +44,12 @@ class RunConfig:
     # max_target_tokens (targets OOM first: ~4 MB/token on 262K vocab),
     # accumulate to ~target_step_tokens per optimizer step
     dynamic_batch: bool = True
-    max_tokens: int = 6000       # micro-batch total-token budget (inputs are cheap)
-    max_target_tokens: int = 500  # micro-batch target-token budget (BINDING:
-                                  # 800 OOMs on 6 GB; logits scale with vocab)
+    max_tokens: int = 6000       # micro-batch total-token budget (SFT steps)
+    max_target_tokens: int = 500  # micro-batch target-token budget (BINDING)
+    rl_micro_tokens: int = 3000  # tighter total budget when use_rl (CE graph +
+    rl_micro_target_tokens: int = 350  # target budget when use_rl; RL section
+                                       # coexists with the CE graph, so RL
+                                       # steps need smaller micros
     target_step_tokens: int = 55000
     max_input_length: int = 1536
     max_target_length: int = 320
@@ -147,9 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--dynamic_batch", action=argparse.BooleanOptionalAction, default=True)
         sp.add_argument("--max_tokens", type=int, default=6000)
         sp.add_argument("--max_target_tokens", type=int, default=500)
+        sp.add_argument("--rl_micro_tokens", type=int, default=3000)
+        sp.add_argument("--rl_micro_target_tokens", type=int, default=350)
         sp.add_argument("--target_step_tokens", type=int, default=55000)
         sp.add_argument("--max_input_length", type=int, default=1536)
-        sp.add_argument("--max_target_length", type=int, default=320)
+        sp.add_argument("--max_target_length", type=int, default=320,
+                        help="Generation/eval output cap. Training targets are NEVER truncated.")
         sp.add_argument("--weight_decay", type=float, default=0.01)
         sp.add_argument("--label_smoothing", type=float, default=0.0)
         sp.add_argument("--neftune_noise_alpha", type=float, default=5.0)

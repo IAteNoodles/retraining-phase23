@@ -119,25 +119,33 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
 
     # token-budget batching: micro-batches packed to max_tokens AND
     # max_target_tokens; accumulation measured so each optimizer step sees
-    # ~target_step_tokens (not guessed from the budget ceiling)
+    # ~target_step_tokens (not guessed from the budget ceiling).
+    # RL steps hold the CE graph AND the candidate forward graph at once,
+    # so micros shrink when use_rl (measured: 6000/500 OOMs there).
     bucket_cfg = None
     effective_grad_accum = cfg.grad_accum
     if cfg.dynamic_batch:
         from .batching import TokenBucketBatchSampler
+        micro_tokens, micro_tgt = cfg.max_tokens, cfg.max_target_tokens
+        if use_rl:
+            micro_tokens = min(micro_tokens, cfg.rl_micro_tokens)
+            micro_tgt = min(micro_tgt, cfg.rl_micro_target_tokens)
+            print(f"  [batching] RL mode: micro budgets capped to "
+                  f"{micro_tokens}/{micro_tgt}tgt", flush=True)
         bucket_cfg = dict(max_batch_size=max(8, cfg.batch_size * 4),
-                          max_tokens=cfg.max_tokens,
-                          max_target_tokens=cfg.max_target_tokens,
+                          max_tokens=micro_tokens,
+                          max_target_tokens=micro_tgt,
                           num_workers=cfg.dataloader_workers,
                           seed=cfg.seed)
         probe = TokenBucketBatchSampler(
             train_dataset, max_batch_size=bucket_cfg["max_batch_size"],
-            max_tokens=cfg.max_tokens, max_target_tokens=cfg.max_target_tokens,
+            max_tokens=micro_tokens, max_target_tokens=micro_tgt,
             shuffle=False, seed=cfg.seed)
         probe_batches = probe._build_batches()
         mean_fill = (sum(sum(probe.lengths[i] for i in b) for b in probe_batches)
                      / max(len(probe_batches), 1))
         effective_grad_accum = max(1, int(round(cfg.target_step_tokens / max(mean_fill, 1))))
-        print(f"  [batching] micro-budget={cfg.max_tokens}/{cfg.max_target_tokens}tgt "
+        print(f"  [batching] micro-budget={micro_tokens}/{micro_tgt}tgt "
               f"(mean fill {mean_fill:.0f}) -> grad_accum={effective_grad_accum} "
               f"(~{effective_grad_accum * mean_fill:.0f} tok/step)", flush=True)
 
