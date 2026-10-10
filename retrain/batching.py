@@ -126,13 +126,16 @@ class BucketDataloaderMixin:
             self.train_dataset,
             max_batch_size=cfg.get("max_batch_size", 32),
             max_tokens=cfg.get("max_tokens", 6000),
-            max_target_tokens=cfg.get("max_target_tokens", 800),
+            max_target_tokens=cfg.get("max_target_tokens", 500),
             bucket_size=cfg.get("bucket_size", 256),
             shuffle=True,
             seed=self.args.seed,
             drop_last=self.args.dataloader_drop_last)
+        workers = int(cfg.get("num_workers", 0))
         loader = DataLoader(self.train_dataset, batch_sampler=sampler,
-                            collate_fn=self.data_collator, num_workers=0)
+                            collate_fn=self.data_collator,
+                            num_workers=workers,
+                            pin_memory=workers > 0)
         try:
             return self.accelerator.prepare(loader)
         except Exception:

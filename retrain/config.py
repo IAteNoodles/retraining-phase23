@@ -28,8 +28,10 @@ class RunConfig:
     lora_r: int = 64
     lora_dropout: float = 0.1
     use_quant: bool = True
-    bf16: bool = False
+    bf16: bool = True            # Ada (4050) runs bf16 as fast or faster than fp16, more stable
     fp16: bool = True
+    compile_model: bool = False  # torch.compile: ~20-30% faster steps, costs warmup + RAM
+    dataloader_workers: int = 2  # keep the GPU fed (0 = main-process loading, stalls)
 
     # optimization
     epochs: int = 3
@@ -132,8 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--lora_r", type=int, default=64)
         sp.add_argument("--lora_dropout", type=float, default=0.1)
         sp.add_argument("--no_quant", action="store_true")
-        sp.add_argument("--bf16", action="store_true")
+        sp.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
         sp.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+        sp.add_argument("--compile_model", action="store_true")
+        sp.add_argument("--dataloader_workers", type=int, default=2)
         sp.add_argument("--epochs", type=int, default=3)
         sp.add_argument("--max_steps", type=int, default=0)
         sp.add_argument("--lr", type=float, default=1e-4)

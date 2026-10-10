@@ -127,6 +127,7 @@ def build_trainer(model, tokenizer, train_dataset, val_dataset, collator,
         bucket_cfg = dict(max_batch_size=max(8, cfg.batch_size * 4),
                           max_tokens=cfg.max_tokens,
                           max_target_tokens=cfg.max_target_tokens,
+                          num_workers=cfg.dataloader_workers,
                           seed=cfg.seed)
         probe = TokenBucketBatchSampler(
             train_dataset, max_batch_size=bucket_cfg["max_batch_size"],

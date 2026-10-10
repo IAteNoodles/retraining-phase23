@@ -95,6 +95,13 @@ def build_model(cfg: RunConfig, tokenizer):
         model = model.to(dtype)
     model.gradient_checkpointing_enable()
     model.print_trainable_parameters()
+    if cfg.compile_model:
+        try:
+            import torch as _torch
+            model = _torch.compile(model)
+            print("torch.compile enabled for training")
+        except Exception as e:
+            print(f"torch.compile unavailable, continuing uncompiled: {e}")
     return model
 
 
