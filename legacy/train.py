@@ -1959,6 +1959,14 @@ def run_training_phase(
 
     if "logging_steps" in ta_params:
         training_kwargs["logging_steps"] = logging_steps
+    if "logging_strategy" in ta_params:
+        training_kwargs["logging_strategy"] = "steps"
+    if "logging_first_step" in ta_params:
+        training_kwargs["logging_first_step"] = True
+    if "disable_tqdm" in ta_params:
+        training_kwargs["disable_tqdm"] = False
+    if "log_level" in ta_params:
+        training_kwargs["log_level"] = "info"
 
     if "warmup_ratio" in ta_params:
         training_kwargs["warmup_ratio"] = 0.06
