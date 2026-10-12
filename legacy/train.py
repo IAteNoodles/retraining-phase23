@@ -3065,14 +3065,13 @@ def main():
     print(f"predict_with_generate: {predict_with_generate}")
 
     try:
-        import torchao  # noqa: F401
-    except ImportError:
-        pass
-    else:
+        from peft.import_utils import is_torchao_available as _is_torchao_available
+        _is_torchao_available()
+    except ImportError as _e:
         raise SystemExit(
-            "torchao is installed (Kaggle image pins 0.10): new PEFT routes LoRA "
-            "creation through it and dies on its version gate. Run "
-            "'!pip uninstall -y torchao' in the notebook, then re-run."
+            f"torchao present but rejected by PEFT ({_e}). New PEFT routes LoRA "
+            "creation through it and dies on its version gate. Uninstall torchao "
+            "('pip uninstall -y torchao') or upgrade it past PEFT's minimum, then re-run."
         )
 
     lora_config = LoraConfig(
