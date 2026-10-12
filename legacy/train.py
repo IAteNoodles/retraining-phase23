@@ -3059,6 +3059,17 @@ def main():
     print(f"Effective batch: {batch_size * grad_accum}")
     print(f"predict_with_generate: {predict_with_generate}")
 
+    try:
+        import torchao  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        raise SystemExit(
+            "torchao is installed (Kaggle image pins 0.10): new PEFT routes LoRA "
+            "creation through it and dies on its version gate. Run "
+            "'!pip uninstall -y torchao' in the notebook, then re-run."
+        )
+
     lora_config = LoraConfig(
         task_type=TaskType.SEQ_2_SEQ_LM,
         r=lora_r,
