@@ -1858,8 +1858,9 @@ class ReinforceTrainer(VRAMSafeTrainer):
                 _grad_ckpt(model_for_ops, True)
             if is_main_process():
                 _dt = (datetime.datetime.now() - _gen_t0).total_seconds()
-                _new = gen_ids.shape[1] - inputs["input_ids"].shape[1]
-                print(f"  [GEN] step={self.state.global_step} generated ~{_new} new tokens in {_dt:.1f}s", flush=True)
+                # T5 is encoder-decoder: generate() returns DECODER-ONLY ids,
+                # so gen length is new tokens directly (never minus prompt).
+                print(f"  [GEN] step={self.state.global_step} generated ~{gen_ids.shape[1]} new tokens in {_dt:.1f}s", flush=True)
             gc.collect()
 
             pred_texts = self.reinforce_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
