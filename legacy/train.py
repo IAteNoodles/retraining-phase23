@@ -1,7 +1,6 @@
 import argparse
 from contextlib import nullcontext
 import datetime
-import faulthandler
 import functools
 import gc
 import inspect
@@ -1528,7 +1527,43 @@ def compute_reward_deadline(pred_cypher, gold_cypher, neo4j_client,
 
 
 _stall_state = {"last_beat": None, "step": "?", "timeout_s": 300,
-                "cooldown_s": 300, "last_dump": 0.0, "running": False}
+                "cooldown_s": 300, "last_dump": 0.0, "running": False,
+                "last_error": ""}
+
+
+def _compact_stacks():
+    """Relay-friendly stacks: every thread on one line (last 12 frames).
+    Full faulthandler dumps get truncated by the log relay; this survives."""
+    import traceback
+    lines = []
+    try:
+        main_ident = threading.main_thread().ident
+    except Exception:
+        main_ident = None
+    try:
+        frames = sys._current_frames()
+    except Exception:
+        return ["<stack capture failed>"]
+    try:
+        names = {t.ident: t.name for t in threading.enumerate()}
+    except Exception:
+        names = {}
+    order = sorted(frames, key=lambda i: (i != main_ident, i))
+    for ident in order:
+        tag = "MAIN" if ident == main_ident else "thr"
+        name = names.get(ident, "?")
+        try:
+            stack = traceback.extract_stack(frames[ident])
+        except Exception:
+            continue
+        kept = [(f.filename.replace("\\", "/").split("/")[-1], f.lineno, f.name)
+                for f in stack[-12:]]
+        chain = " <- ".join(f"{fn}:{ln}:{nm}" for fn, ln, nm in kept)
+        lines.append(f"[{tag}:{name}] {chain}")
+        if len(lines) >= 14:
+            lines.append(f"... +{len(frames) - 14} more threads")
+            break
+    return lines
 
 
 def stall_beat(step=None):
@@ -1566,11 +1601,12 @@ def start_stall_watch(timeout_s=300, cooldown_s=0):
                 now_ts = datetime.datetime.now().timestamp()
                 if idle >= _stall_state["timeout_s"] and now_ts - _stall_state["last_dump"] >= _stall_state["cooldown_s"]:
                     _stall_state["last_dump"] = now_ts
-                    print(f"\n[STALL_WATCH][rank={rank}] NO training progress for {idle:.0f}s (step={_stall_state['step']}, timeout={_stall_state['timeout_s']}s). Dumping all thread stacks:", flush=True)
+                    print(f"\n[STALL_WATCH][rank={rank}] NO training progress for {idle:.0f}s (step={_stall_state['step']}, timeout={_stall_state['timeout_s']}s, last_error={_stall_state['last_error'] or 'none'}). Thread stacks:", flush=True)
                     try:
-                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                        for _line in _compact_stacks():
+                            print(f"[STALL_WATCH][rank={rank}] {_line}", flush=True)
                     except Exception as _e:
-                        print(f"[STALL_WATCH] faulthandler failed: {_e}", flush=True)
+                        print(f"[STALL_WATCH] stack capture failed: {_e}", flush=True)
                     try:
                         if torch.cuda.is_available():
                             print(f"[STALL_WATCH][rank={rank}] cuda reserved={torch.cuda.memory_reserved() / 1e9:.2f}G allocated={torch.cuda.memory_allocated() / 1e9:.2f}G", flush=True)
@@ -2368,6 +2404,7 @@ def run_training_phase(
         train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
         print(f"\n{phase_name} complete. Metrics: {train_result.metrics}")
     except RuntimeError as e:
+        _stall_state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
         _save_crash_checkpoint(trainer, output_dir, phase_name,
                                hf_repo_id=hf_repo_id, hf_token=hf_token,
                                hf_path_prefix=hf_path_prefix)
@@ -2417,6 +2454,19 @@ def _save_crash_checkpoint(trainer, output_dir, phase_name,
     except Exception:
         step = 0
     try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            print("[CrashSave] non-rank0: skipping crash save (rank0 handles it).")
+            return
+    except Exception:
+        pass
+    try:
+        # Crash-save must not touch collectives: NCCL is usually already dead
+        # here (_save_checkpoint's FLOPS allgather wedges forever otherwise).
+        try:
+            trainer.store_flos = lambda: None
+        except Exception:
+            pass
         trainer._save_checkpoint(trainer.model, None)
         print(f"[CrashSave] {phase_name} weights saved at step {step} "
               f"(resumable via --resume_checkpoint).")
