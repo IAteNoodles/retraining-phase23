@@ -1670,6 +1670,14 @@ class ReinforceTrainer(VRAMSafeTrainer):
         model_float_dtype = get_model_float_dtype(model_for_ops)
         labels = inputs["labels"]
         do_reinforce = model.training and (self.state.global_step - self._last_reinforce_step >= 2)
+        # Monster batches (1600-token rows): no-KV-cache generation costs
+        # ~10 min/microbatch for 0.03% of data. SFT-only past 1024 tokens.
+        seq_len = inputs["input_ids"].shape[1]
+        if do_reinforce and seq_len > 1024:
+            do_reinforce = False
+            if is_main_process() and self.state.global_step != getattr(self, "_last_long_skip_log", -1):
+                print(f"  [RL_SKIP] SFT-only at step={self.state.global_step} (batch seq_len={seq_len} > 1024)", flush=True)
+                self._last_long_skip_log = self.state.global_step
 
         if do_reinforce:
             model_for_ops.config.output_hidden_states = True
