@@ -2531,6 +2531,7 @@ def main():
     parser.add_argument("--eval_model_dir", type=str, default="", help="Explicit full model/checkpoint directory for --eval_only. Can point to best/, best_checkpoint/, checkpoint-*, merged_eval/, or a parent containing those.")
     parser.add_argument("--final_test_only", action="store_true", help="With --eval_only, skip validation eval and run only the final test set")
     parser.add_argument("--skip_final_test", action="store_true", help="Skip the end-of-run test generation eval (e.g. when the final test runs on another machine)")
+    parser.add_argument("--skip_final_eval", action="store_true", help="Skip the whole end-of-run merge/eval/upload block (legs mode: laptop verdicts cover evaluation, adapters upload per-save)")
     parser.add_argument("--train_parquet", type=str, default="splits/train_t5.parquet")
     parser.add_argument("--val_parquet", type=str, default="splits/val_answerable.parquet")
     parser.add_argument("--test_parquet", type=str, default="splits/test_answerable.parquet")
@@ -2948,13 +2949,24 @@ def main():
 
                 if args.upload_checkpoints and args.hf_repo_id and hf_path_prefix:
                     merged_base_repo_path = join_hf_path(hf_path_prefix, "merged_base")
-                    print(f"Uploading merged Phase 1 base to {args.hf_repo_id}/{merged_base_repo_path}...")
-                    _upload_folder_resilient(
-                        repo_id=args.hf_repo_id,
-                        folder_path=merged_phase1_dir,
-                        path_in_repo=merged_base_repo_path,
-                        token=args.hf_token,
-                    )
+                    _remote_has_base = False
+                    try:
+                        from huggingface_hub import HfApi
+                        _rfiles = HfApi().list_repo_files(args.hf_repo_id, token=args.hf_token)
+                        _remote_has_base = any(
+                            f.startswith(merged_base_repo_path + "/") for f in _rfiles)
+                    except Exception as e:
+                        print(f"[MergeBase] Hub check failed ({e}); uploading anyway.")
+                    if _remote_has_base:
+                        print(f"Merged base already on Hub at {merged_base_repo_path}; skipping re-upload.")
+                    else:
+                        print(f"Uploading merged Phase 1 base to {args.hf_repo_id}/{merged_base_repo_path}...")
+                        _upload_folder_resilient(
+                            repo_id=args.hf_repo_id,
+                            folder_path=merged_phase1_dir,
+                            path_in_repo=merged_base_repo_path,
+                            token=args.hf_token,
+                        )
 
                 print("Reloading merged model in full precision (fp32, like phase 1) with fresh LoRA...")
                 model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -3197,6 +3209,10 @@ def main():
         if args.phase2 and phase2_output_dir != args.output_dir:
             sync_missing_local_to_hf(phase2_output_dir, args.hf_repo_id, hf_token=args.hf_token, include_best=True, hf_path_prefix=hf_path_prefix)
 
+    if args.skip_final_eval and not args.eval_only:
+        print("Skipping end-of-run merge/eval/upload block (--skip_final_eval). Adapters upload per-save; laptop verdicts + laptop final cover evaluation.")
+        return
+
     eval_source_is_full_model = is_full_model_dir(best_dir)
     if eval_source_is_full_model:
         merged_dir = best_dir
@@ -3265,6 +3281,7 @@ def main():
     eval_model = AutoModelForSeq2SeqLM.from_pretrained(
         merged_dir, attn_implementation="sdpa",
     )
+    eval_model = unify_model_dtype(eval_model, model_dtype, "eval-reload")
     if not hasattr(eval_model.config, 'decoder_start_token_id') or eval_model.config.decoder_start_token_id is None:
         fallback = getattr(getattr(eval_model.config, "decoder", None), "bos_token_id", None)
         if fallback is not None:
