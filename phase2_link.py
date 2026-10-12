@@ -37,9 +37,10 @@ CONTINUE = "CONTINUE"
 STOP = "STOP"
 
 
-def make_request(job, step, checkpoint="", train_loss=None):
+def make_request(job, step, checkpoint="", train_loss=None, auth=None):
     return {"type": EVAL_REQUEST, "job": job, "step": step,
-            "checkpoint": checkpoint, "train_loss": train_loss}
+            "checkpoint": checkpoint, "train_loss": train_loss,
+            "auth": auth}
 
 
 def make_verdict(step, decision, reason=""):
@@ -55,11 +56,12 @@ class EvalGate:
     (e.g. ("localhost", 1055)). Direct connection when None.
     """
 
-    def __init__(self, url, every=2, timeout=30, proxy=None):
+    def __init__(self, url, every=2, timeout=30, proxy=None, auth=None):
         self.url = url
         self.every = every
         self.timeout = timeout
         self.proxy = proxy
+        self.auth = auth
         self._pending_stop = False
 
     def due(self, step):
@@ -83,7 +85,7 @@ class EvalGate:
             ws = self._connect()
             try:
                 ws.send(json.dumps(make_request(job, step, checkpoint,
-                                               train_loss)))
+                                               train_loss, auth=self.auth)))
                 ws.settimeout(self.timeout)
                 raw = ws.recv()
             finally:
@@ -122,9 +124,11 @@ class EvalGate:
             pass
 
 
-def run_server(host, port, decide, timeout_note=""):
+def run_server(host, port, decide, auth=None):
     """Laptop-side asyncio server. decide(step:int, payload:dict)
-    -> (decision, reason). Runs until cancelled. CPU-only."""
+    -> (decision, reason). Runs until cancelled. CPU-only.
+    auth: when set, EVAL_REQUEST must carry the same token or gets ERROR
+    (required when exposed over public funnel)."""
     import asyncio
     import websockets
 
@@ -139,6 +143,10 @@ def run_server(host, port, decide, timeout_note=""):
                     continue
                 mtype = msg.get("type")
                 if mtype == EVAL_REQUEST:
+                    if auth is not None and msg.get("auth") != auth:
+                        await ws.send(json.dumps({"type": ERROR,
+                                                  "detail": "bad auth"}))
+                        continue
                     step = int(msg.get("step", -1))
                     try:
                         decision, reason = decide(step, msg)
