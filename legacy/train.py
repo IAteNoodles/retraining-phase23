@@ -983,7 +983,7 @@ def get_unique_databases_from_dataset(data_dir, train_parquet="", val_parquet=""
 
 
 class Neo4jClient:
-    def __init__(self, url="", port=15964, user="neo4j", password="berttokg123", database="neo4j", database_mapping=None):
+    def __init__(self, url="", port=15964, user="neo4j", password="berttokg123", database="neo4j", database_mapping=None, proxies=None):
         self._cache = {}
         self.database = database
         self.database_mapping = database_mapping or {}
@@ -1025,6 +1025,8 @@ class Neo4jClient:
             self.session = requests.Session()
             self.session.auth = (user, password)
             self.session.headers.update({"Content-Type": "application/json"})
+            if proxies:
+                self.session.proxies.update(proxies)
 
     def _resolve_database(self, database=None):
         database_name = str(database or self.database)
@@ -2576,6 +2578,7 @@ def main():
     parser.add_argument("--neo4j_discovery_timeout", type=float, default=5.0, help="Seconds to wait for each Neo4j endpoint probe")
     parser.add_argument("--neo4j_auto_select", action="store_true", help="Use the first reachable Neo4j endpoint without prompting when multiple are available")
     parser.add_argument("--neo4j_skip_discovery", action="store_true", help="Skip train.py Neo4j discovery because the notebook already preflighted and selected --neo4j_url")
+    parser.add_argument("--neo4j_proxies", type=str, default="", help="Optional proxy URL applied to http+https (e.g. socks5://localhost:1055 for userspace-tailscale Kaggle)")
     parser.add_argument("--neo4j_preflight_mode", type=str, default="fallback", choices=["fallback", "dataset", "all_mapped"], help="Preflight DB check mode: fallback=only default DB, dataset=only mapped DBs in data, all_mapped=all DBs in mapping")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout rate")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing factor")
@@ -2976,6 +2979,9 @@ def main():
                 neo4j_client = None
                 if args.phase2_reinforce:
                     print_reward_function_description()
+                    proxies = ({"http": args.neo4j_proxies,
+                                "https": args.neo4j_proxies}
+                               if args.neo4j_proxies else None)
                     neo4j_client = Neo4jClient(
                         url=args.neo4j_url,
                         port=args.neo4j_port,
@@ -2983,6 +2989,7 @@ def main():
                         password=args.neo4j_password,
                         database=args.neo4j_database,
                         database_mapping=args.neo4j_database_mapping,
+                        proxies=proxies,
                     )
                     if is_main_process():
                         if args.neo4j_url:
@@ -3228,11 +3235,14 @@ def main():
 
     eval_neo4j = None
     if args.phase2_reinforce:
+        eval_proxies = ({"http": args.neo4j_proxies, "https": args.neo4j_proxies}
+                        if args.neo4j_proxies else None)
         eval_neo4j = Neo4jClient(
             url=args.neo4j_url,
             port=args.neo4j_port, user=args.neo4j_user, password=args.neo4j_password,
             database=args.neo4j_database,
             database_mapping=args.neo4j_database_mapping,
+            proxies=eval_proxies,
         )
         if args.neo4j_url:
             print(f"Neo4j client created for eval execution metrics ({args.neo4j_url})")

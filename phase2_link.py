@@ -49,23 +49,38 @@ def make_verdict(step, decision, reason=""):
 
 
 class EvalGate:
-    """Trainer-side (Kaggle) sync client. CPU-only, no GPU touched."""
+    """Trainer-side (Kaggle) sync client. CPU-only, no GPU touched.
 
-    def __init__(self, url, every=2, timeout=30):
+    proxy: optional (host, port) SOCKS5 for userspace-tailscale Kaggle
+    (e.g. ("localhost", 1055)). Direct connection when None.
+    """
+
+    def __init__(self, url, every=2, timeout=30, proxy=None):
         self.url = url
         self.every = every
         self.timeout = timeout
+        self.proxy = proxy
         self._pending_stop = False
 
     def due(self, step):
         return step > 0 and step % self.every == 0
+
+    def _connect(self):
+        import websocket
+        if self.proxy:
+            host, port = self.proxy
+            return websocket.create_connection(
+                self.url, timeout=self.timeout,
+                http_proxy_host=host, http_proxy_port=port,
+                proxy_type="socks5h")
+        return websocket.create_connection(self.url, timeout=self.timeout)
 
     def notify(self, step, checkpoint="", train_loss=None, job="phase2"):
         """Ask laptop for a verdict. Always returns CONTINUE or STOP;
         never raises (fail-open to CONTINUE)."""
         import websocket
         try:
-            ws = websocket.create_connection(self.url, timeout=self.timeout)
+            ws = self._connect()
             try:
                 ws.send(json.dumps(make_request(job, step, checkpoint,
                                                train_loss)))
@@ -91,7 +106,13 @@ class EvalGate:
         """Best-effort CHECKPOINT_DONE; never raises."""
         import websocket
         try:
-            ws = websocket.create_connection(self.url, timeout=10)
+            if self.proxy:
+                host, port = self.proxy
+                ws = websocket.create_connection(
+                    self.url, timeout=10, http_proxy_host=host,
+                    http_proxy_port=port, proxy_type="socks5h")
+            else:
+                ws = websocket.create_connection(self.url, timeout=10)
             try:
                 ws.send(json.dumps({"type": CHECKPOINT_DONE, "step": step,
                                     "stopped": bool(stopped)}))
