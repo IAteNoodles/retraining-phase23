@@ -1837,6 +1837,10 @@ class ReinforceTrainer(VRAMSafeTrainer):
                                 ))
                             _L = max(p.shape[1] for p in _parts)
                             gen_ids = torch.cat([torch.nn.functional.pad(p, (0, _L - p.shape[1]), value=self.reinforce_tokenizer.pad_token_id) for p in _parts], dim=0)
+                            if is_main_process():
+                                _S = inputs["input_ids"].shape[1]
+                                _lens = [p.shape[1] for p in _parts]
+                                print(f"  [GEN] step={self.state.global_step} prompt_len={_S} part_lens={_lens} padded_to={_L}", flush=True)
                             del _parts
                         else:
                             gen_ids = model_for_ops.generate(
@@ -2028,6 +2032,9 @@ class ReinforceTrainer(VRAMSafeTrainer):
 
             total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
             print(f"  [RL_LOSS] reinforce={reinforce_loss.item():.4f} entropy={entropy.item():.4f} kl={kl_loss.item():.4f} total={total_loss.item():.4f}", flush=True)
+            if is_main_process():
+                _dt2 = (datetime.datetime.now() - _gen_t0).total_seconds()
+                print(f"  [RL_FWD] step={self.state.global_step} forward done in {_dt2:.1f}s (backward next)", flush=True)
             del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
 
             return (total_loss, None) if return_outputs else total_loss
