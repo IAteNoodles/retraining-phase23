@@ -1442,6 +1442,34 @@ def _reward_value(reward_result):
     return float(reward_result)
 
 
+def compute_reward_deadline(pred_cypher, gold_cypher, neo4j_client,
+                            timeout_s=120, **kwargs):
+    """compute_reward with a hard wall-clock deadline.
+
+    Fences hangs that requests timeouts don't cover (DNS stalls, dead
+    proxies): the work runs on a daemon thread, the trainer moves on.
+    On timeout returns an exec-fail-style result so the step continues.
+    """
+    import threading
+    box = {}
+
+    def _run():
+        try:
+            box["r"] = compute_reward(pred_cypher, gold_cypher,
+                                      neo4j_client, **kwargs)
+        except Exception as e:
+            box["r"] = (-3.0, False,
+                        {"branch": f"reward_error:{type(e).__name__}",
+                         "reward": -3.0})
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if "r" in box:
+        return box["r"]
+    return (-3.0, False, {"branch": "reward_timeout", "reward": -3.0})
+
+
 def print_reward_function_description():
     if not is_main_process():
         return
@@ -1551,7 +1579,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
     diversity_coef=0.0, simplicity_coef=0.0,
     consistency_coef=0.0, dynamic_batch=False, max_tokens=50000,
                  dynamic_generation_length=False, generation_length_tolerance=0.10,
-                 rl_warmup_steps=0, roll_stream=None,
+                 rl_warmup_steps=0, roll_stream=None, reward_timeout=120,
                  **kwargs):
         model = kwargs.get('model')
         if model is not None:
@@ -1605,6 +1633,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
         self.dynamic_generation_length = dynamic_generation_length
         self.generation_length_tolerance = max(0.0, generation_length_tolerance)
         self.rl_warmup_steps = max(0, int(rl_warmup_steps))
+        self.reward_timeout = max(10, int(reward_timeout))
         self._last_reinforce_step = -5
 
         inactive = []
@@ -1755,10 +1784,11 @@ class ReinforceTrainer(VRAMSafeTrainer):
                     candidate_indices = [candidate_idx * batch_size + i for candidate_idx in range(n_candidates)]
                     group_candidates = [pred_texts[idx].strip() for idx in candidate_indices]
                     group_results = [
-                        compute_reward(
+                        compute_reward_deadline(
                             c,
                             gold,
                             self.neo4j_client,
+                            timeout_s=self.reward_timeout,
                             gold_answer_json=gold_answers[i] if i < len(gold_answers) else None,
                             database=databases[i] if i < len(databases) else None,
                             input_text=input_texts[i] if i < len(input_texts) else None,
@@ -1775,10 +1805,11 @@ class ReinforceTrainer(VRAMSafeTrainer):
                     branches.append(group_results[best_idx][2].get("branch", "unknown") if isinstance(group_results[best_idx], tuple) else "legacy")
                     best_gen_ids.append(gen_ids[candidate_indices[best_idx]])
                 else:
-                    reward_result = compute_reward(
+                    reward_result = compute_reward_deadline(
                         pred_texts[i].strip(),
                         gold,
                         self.neo4j_client,
+                        timeout_s=self.reward_timeout,
                         gold_answer_json=gold_answers[i] if i < len(gold_answers) else None,
                         database=databases[i] if i < len(databases) else None,
                         input_text=input_texts[i] if i < len(input_texts) else None,
@@ -1912,7 +1943,7 @@ def run_training_phase(
     eos_suppress_strength=0.0, eos_suppress_full_until=0,
     eos_suppress_decay_until=0, chunk_size=1,
     diversity_coef=0.0, simplicity_coef=0.0,
-    consistency_coef=0.0, rl_warmup_steps=0, dynamic_batch=False, max_tokens=50000,
+    consistency_coef=0.0, rl_warmup_steps=0, reward_timeout=120, dynamic_batch=False, max_tokens=50000,
     length_bucket_size=256, sample_eval_interval=0,
     dynamic_generation_length=False, generation_length_tolerance=0.10,
     dataloader_num_workers=4, dataloader_pin_memory=True,
@@ -2091,6 +2122,7 @@ def run_training_phase(
             simplicity_coef=simplicity_coef,
             consistency_coef=consistency_coef,
             rl_warmup_steps=rl_warmup_steps,
+            reward_timeout=reward_timeout,
             dynamic_generation_length=dynamic_generation_length,
             generation_length_tolerance=generation_length_tolerance,
             **trainer_kwargs,
@@ -2561,6 +2593,7 @@ def main():
     parser.add_argument("--reinforce_coef", type=float, default=1.0, help="Weight for REINFORCE loss term")
     parser.add_argument("--reinforce_candidates", type=int, default=1, help="Generate N candidates per input, take best reward")
     parser.add_argument("--rl_warmup_steps", type=int, default=50, help="Number of SFT-only steps before RL kicks in; avoids RL on an untrained model")
+    parser.add_argument("--rl_reward_timeout", type=int, default=120, help="Hard wall-clock deadline (s) per reward computation; fences DNS/proxy stalls, wedged calls score -3 and training continues")
     parser.add_argument("--reward_ema_alpha", type=float, default=0.1, help="EMA smoothing for reward baseline")
     parser.add_argument("--entropy_coef", type=float, default=0.0, help="Entropy bonus coefficient for sampled RL tokens")
     parser.add_argument("--entropy_beta", type=float, default=None, help="Alias for --entropy_coef from trainv1")
@@ -3126,6 +3159,7 @@ def main():
                     simplicity_coef=args.simplicity_coef,
                     consistency_coef=args.consistency_coef,
                     rl_warmup_steps=args.rl_warmup_steps,
+                    reward_timeout=args.rl_reward_timeout,
                     dynamic_batch=args.dynamic_batch,
                     max_tokens=args.max_tokens,
                     length_bucket_size=args.length_bucket_size,
