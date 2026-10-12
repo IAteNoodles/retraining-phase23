@@ -3018,7 +3018,10 @@ def main():
                 phase2_lr = args.phase2_lr if args.phase2_lr > 0 else args.lr * 0.5
                 phase2_epochs = args.phase2_epochs if args.phase2_epochs > 0 else args.epochs
                 phase2_resume = None
-                if args.resume:
+                if args.resume_checkpoint and os.path.isdir(args.resume_checkpoint):
+                    phase2_resume = args.resume_checkpoint
+                    print(f"Resuming Phase 2 from explicit checkpoint: {phase2_resume}")
+                elif args.resume:
                     p2_latest = find_latest_checkpoint(phase2_output_dir)
                     if p2_latest:
                         phase2_resume = p2_latest
