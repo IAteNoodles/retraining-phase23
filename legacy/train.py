@@ -2064,6 +2064,65 @@ class ReinforceTrainer(VRAMSafeTrainer):
             best_gen_ids = torch.stack(best_gen_ids)
             decoder_input_ids = best_gen_ids[:, :-1]
             target_ids = best_gen_ids[:, 1:]
+            if batch_size > 1 and not self.entropy_coef and not self.kl_coef:
+                # VRAM: per-sample outputs2 + chunked softmax + immediate
+                # backward. A batched outputs2 graph plus batched
+                # chunked-softmax saves (~1 GB/sample transient) OOMs 6 GB
+                # GPUs past batch 1; doing each sample fully (forward,
+                # backward, free) in turn restores the batch-1 peak and is
+                # bit-exact vs one joint backward. Batch-1 path below
+                # untouched (Kaggle identical).
+                _gas = float(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
+                _adv = advantage.detach()
+                _rb0 = datetime.datetime.now()
+                (self.sft_coef * ce_loss / _gas).backward()
+                _pad_id = self.reinforce_tokenizer.pad_token_id
+                _T = target_ids.shape[1]
+                _CH = 64
+                _rl_rep_sum = 0.0
+                for _i in range(batch_size):
+                    _out_i = model(
+                        input_ids=inputs["input_ids"][_i:_i + 1],
+                        attention_mask=inputs["attention_mask"][_i:_i + 1],
+                        decoder_input_ids=decoder_input_ids[_i:_i + 1],
+                    )
+                    _log_i = _out_i.logits
+                    del _out_i
+                    _m_i = (target_ids[_i] != _pad_id).float()
+                    _t_i = target_ids[_i]
+                    _seq = torch.zeros((), device=_log_i.device, dtype=torch.float32)
+                    for _s in range(0, _T, _CH):
+                        _e = min(_s + _CH, _T)
+                        _lp = F.log_softmax(_log_i[:, _s:_e, :].float(), dim=-1)
+                        _tlp = _lp.gather(2, _t_i[_s:_e].unsqueeze(0).unsqueeze(-1)).squeeze(-1).squeeze(0)
+                        _seq = _seq + (_tlp * _m_i[_s:_e]).sum()
+                        del _lp, _tlp
+                    del _log_i
+                    _rep_i = -(_seq * _adv[_i])
+                    _rl_rep_sum += _rep_i.detach().item() if torch.is_tensor(_rep_i) else float(_rep_i)
+                    _rl_i = torch.nan_to_num(_rep_i * (self.reinforce_coef / (batch_size * _gas)), nan=0.0, posinf=0.0, neginf=0.0)
+                    _rl_i.backward()
+                    del _seq, _rep_i, _rl_i
+                if self.critic is not None and not self.disable_critic:
+                    critic_loss = F.mse_loss(critic_pred, rewards)
+                    critic_loss = torch.nan_to_num(critic_loss, nan=0.0, posinf=0.0, neginf=0.0)
+                    (0.1 * critic_loss / _gas).backward()
+                else:
+                    critic_loss = torch.tensor(0.0, device=ce_loss.device)
+                reinforce_loss = torch.tensor(_rl_rep_sum / max(batch_size, 1), device=ce_loss.device)
+                total_loss = self.sft_coef * ce_loss.detach() + self.reinforce_coef * reinforce_loss
+                total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
+                entropy = torch.zeros((), device=total_loss.device)
+                kl_loss = torch.tensor(0.0, device=total_loss.device)
+                print(f"  [RL_LOSS] reinforce={reinforce_loss.item():.4f} entropy={entropy.item():.4f} kl={kl_loss.item():.4f} total={total_loss.item():.4f}", flush=True)
+                if is_main_process():
+                    _dt2 = (datetime.datetime.now() - _gen_t0).total_seconds()
+                    print(f"  [RL_FWD] step={self.state.global_step} forward done in {_dt2:.1f}s (backward next)", flush=True)
+                    _dt3 = (datetime.datetime.now() - _rb0).total_seconds()
+                    print(f"  [RL_BWD] step={self.state.global_step} per-sample sequential backward done in {_dt3:.1f}s", flush=True)
+                del best_gen_ids, decoder_input_ids, target_ids
+                _ret = total_loss.detach().requires_grad_()
+                return (_ret, None) if return_outputs else _ret
             outputs2 = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -2137,28 +2196,6 @@ class ReinforceTrainer(VRAMSafeTrainer):
             if is_main_process():
                 _dt2 = (datetime.datetime.now() - _gen_t0).total_seconds()
                 print(f"  [RL_FWD] step={self.state.global_step} forward done in {_dt2:.1f}s (backward next)", flush=True)
-            if batch_size > 1 and not self.entropy_coef and not self.kl_coef:
-                # VRAM: per-sample sequential backward. The batched RL graph
-                # (~1 GB/sample of chunked-softmax saves) OOMs 6 GB GPUs past
-                # batch 1; freeing each sample's graph in turn restores the
-                # batch-1 peak. Bit-exact vs one joint backward (sum of grads;
-                # Trainer scaling mirrored: divide by grad-accum steps here,
-                # return a grad-free leaf so Trainer's own backward is a no-op).
-                # Batch-1 path below untouched (Kaggle identical).
-                _gas = float(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
-                _adv = advantage.detach()
-                _rb0 = datetime.datetime.now()
-                (self.sft_coef * ce_loss / _gas).backward()
-                for _i in range(batch_size):
-                    (-(seq_log_prob[_i] * _adv[_i]) * (self.reinforce_coef / (batch_size * _gas))).backward()
-                if self.critic is not None and not self.disable_critic:
-                    (0.1 * critic_loss / _gas).backward()
-                if is_main_process():
-                    _dt3 = (datetime.datetime.now() - _rb0).total_seconds()
-                    print(f"  [RL_BWD] step={self.state.global_step} per-sample sequential backward done in {_dt3:.1f}s", flush=True)
-                _ret = total_loss.detach().requires_grad_()
-                del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
-                return (_ret, None) if return_outputs else _ret
             del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
 
             return (total_loss, None) if return_outputs else total_loss
