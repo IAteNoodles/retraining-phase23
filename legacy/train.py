@@ -2255,6 +2255,13 @@ def run_training_phase(
     if "ddp_find_unused_parameters" in ta_params:
         training_kwargs["ddp_find_unused_parameters"] = False
 
+    # Fail fast on NCCL skew: 10 min instead of the 30-min default, so a wedged
+    # collective surfaces (and crash-saves) instead of burning quota silently.
+    if "ddp_timeout" in ta_params:
+        training_kwargs["ddp_timeout"] = datetime.timedelta(seconds=600)
+        if is_main_process():
+            print("ddp_timeout=600s (fail fast on NCCL skew)")
+
     if "neftune_noise_alpha" in ta_params:
         training_kwargs["neftune_noise_alpha"] = neftune_noise_alpha
 
