@@ -69,7 +69,10 @@ class EvalGate:
 
     def _connect(self):
         import websocket
-        if self.proxy:
+        # Public wss:// always goes direct (Kaggle has internet); only
+        # tailnet ws:// rides the userspace SOCKS proxy. Proxying TLS
+        # through SOCKS breaks the handshake (SSLEOF).
+        if self.proxy and self.url.startswith("ws://"):
             host, port = self.proxy
             return websocket.create_connection(
                 self.url, timeout=self.timeout,
@@ -108,7 +111,7 @@ class EvalGate:
         """Best-effort CHECKPOINT_DONE; never raises."""
         import websocket
         try:
-            if self.proxy:
+            if self.proxy and self.url.startswith("ws://"):
                 host, port = self.proxy
                 ws = websocket.create_connection(
                     self.url, timeout=10, http_proxy_host=host,
