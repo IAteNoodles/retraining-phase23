@@ -1,6 +1,7 @@
 import argparse
 from contextlib import nullcontext
 import datetime
+import functools
 import gc
 import inspect
 import json
@@ -1326,7 +1327,10 @@ def _normalize_gold_value(value):
     return Neo4jClient._flatten(value)
 
 
+@functools.lru_cache(maxsize=None)
 def _parse_gold_answer(gold_answer_json):
+    """Parsed gold sets are cached: monster rows (up to ~1M result rows)
+    parse once and reuse. Return value is read-only for all callers."""
     if not gold_answer_json or not isinstance(gold_answer_json, str):
         return None
     try:
