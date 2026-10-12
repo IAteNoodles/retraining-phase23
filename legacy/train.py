@@ -2955,19 +2955,14 @@ def main():
                         token=args.hf_token,
                     )
 
-                print("Reloading merged model in 4-bit with fresh LoRA...")
-                bnb_config_p2 = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16 if use_bf16 else torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                )
+                print("Reloading merged model in full precision (fp32, like phase 1) with fresh LoRA...")
                 model = AutoModelForSeq2SeqLM.from_pretrained(
                     merged_phase1_dir,
                     local_files_only=True,
-                    quantization_config=bnb_config_p2,
                     attn_implementation="sdpa",
+                    torch_dtype=model_dtype,
                 )
+                model = unify_model_dtype(model, model_dtype, "merge-phase1-reload")
                 if not hasattr(model.config, 'decoder_start_token_id') or model.config.decoder_start_token_id is None:
                     fallback = getattr(getattr(model.config, "decoder", None), "bos_token_id", None)
                     if fallback is not None:
