@@ -1631,7 +1631,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
     diversity_coef=0.0, simplicity_coef=0.0,
     consistency_coef=0.0, dynamic_batch=False, max_tokens=50000,
                  dynamic_generation_length=False, generation_length_tolerance=0.10,
-                 rl_warmup_steps=0, roll_stream=None, reward_timeout=120,
+                 rl_warmup_steps=0, roll_stream=None, reward_timeout=30,
                  **kwargs):
         model = kwargs.get('model')
         if model is not None:
@@ -2071,7 +2071,7 @@ def run_training_phase(
     eos_suppress_strength=0.0, eos_suppress_full_until=0,
     eos_suppress_decay_until=0, chunk_size=1,
     diversity_coef=0.0, simplicity_coef=0.0,
-    consistency_coef=0.0, rl_warmup_steps=0, reward_timeout=120, dynamic_batch=False, max_tokens=50000,
+    consistency_coef=0.0, rl_warmup_steps=0, reward_timeout=30, dynamic_batch=False, max_tokens=50000,
     length_bucket_size=256, sample_eval_interval=0,
     dynamic_generation_length=False, generation_length_tolerance=0.10,
     dataloader_num_workers=4, dataloader_pin_memory=True,
@@ -2721,7 +2721,7 @@ def main():
     parser.add_argument("--reinforce_coef", type=float, default=1.0, help="Weight for REINFORCE loss term")
     parser.add_argument("--reinforce_candidates", type=int, default=1, help="Generate N candidates per input, take best reward")
     parser.add_argument("--rl_warmup_steps", type=int, default=50, help="Number of SFT-only steps before RL kicks in; avoids RL on an untrained model")
-    parser.add_argument("--rl_reward_timeout", type=int, default=120, help="Hard wall-clock deadline (s) per reward computation; fences DNS/proxy stalls, wedged calls score -3 and training continues")
+    parser.add_argument("--rl_reward_timeout", type=int, default=30, help="Hard wall-clock deadline (s) per reward computation; fences DNS/proxy stalls, wedged calls score -3 and training continues. Kept small so DDP ranks cannot skew past the NCCL watchdog (sequential loop: worst skew ~= 8x this).")
     parser.add_argument("--reward_ema_alpha", type=float, default=0.1, help="EMA smoothing for reward baseline")
     parser.add_argument("--entropy_coef", type=float, default=0.0, help="Entropy bonus coefficient for sampled RL tokens")
     parser.add_argument("--entropy_beta", type=float, default=None, help="Alias for --entropy_coef from trainv1")
