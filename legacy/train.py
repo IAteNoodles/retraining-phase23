@@ -2178,8 +2178,8 @@ def run_training_phase(
     dynamic_generation_length=False, generation_length_tolerance=0.10,
     dataloader_num_workers=4, dataloader_pin_memory=True,
     use_bf16=False, use_fp16=False,
-    max_steps=0, save_steps=200, hf_repo_id="", hf_token="", hf_path_prefix="",
-    eval_after_resume=False, logging_steps=50,
+     max_steps=0, save_steps=200, hf_repo_id="", hf_token="", hf_path_prefix="",
+     eval_after_resume=False, logging_steps=50, fresh_optimizer=False,
 ):
     def _compute_metrics(eval_pred):
         return compute_metrics(eval_pred, tokenizer, neo4j_client=neo4j_client)
@@ -2408,7 +2408,11 @@ def run_training_phase(
         print(f"{'='*60}\n")
 
     try:
-        train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
+        if fresh_optimizer and resume_checkpoint:
+            print(f"[{phase_name}] --fresh_optimizer: adapter weights already loaded from {resume_checkpoint}; starting trainer fresh (no optimizer/scheduler/RNG restore).")
+            train_result = trainer.train()
+        else:
+            train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
         print(f"\n{phase_name} complete. Metrics: {train_result.metrics}")
     except RuntimeError as e:
         _stall_state["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
@@ -2808,6 +2812,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true", help="Show resume selection prompt inside train.py")
     parser.add_argument("--resume_checkpoint", type=str, default="", help="Explicit checkpoint path to resume from (recommended for notebook-controlled flow)")
+    parser.add_argument("--fresh_optimizer", action="store_true", help="Load adapter weights from --resume_checkpoint but start trainer fresh (no optimizer/scheduler/RNG restore). Required when switching precision (e.g. fp32 Hub checkpoint -> bf16 laptop).")
     parser.add_argument("--eval_after_resume", action="store_true", help="Run loss eval immediately after resuming from a checkpoint")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for torchrun/DDP (also read from LOCAL_RANK env)")
     parser.add_argument("--eval_only", action="store_true", help="Only run post-training eval on best checkpoint")
@@ -3326,6 +3331,12 @@ def main():
                         print(f"Resuming Phase 2 from checkpoint: {phase2_resume}")
                         from safetensors.torch import load_file
                         adapter_weights = load_file(os.path.join(p2_latest, "adapter_model.safetensors"))
+                        if model_dtype is not torch.float32:
+                            adapter_weights = {
+                                k: (v.to(model_dtype) if torch.is_floating_point(v) else v)
+                                for k, v in adapter_weights.items()
+                            }
+                            print(f"Cast resume adapter weights to {model_dtype} (precision switch)")
                         model.load_state_dict(adapter_weights, strict=False)
                         print("Loaded Phase 2 adapter weights from checkpoint")
                 neo4j_client = None
@@ -3441,6 +3452,7 @@ def main():
                     hf_token=args.hf_token,
                     hf_path_prefix=hf_path_prefix,
                     eval_after_resume=args.eval_after_resume,
+                    fresh_optimizer=args.fresh_optimizer,
                 )
                 if phase2_best is not None:
                     best_dir = phase2_best
