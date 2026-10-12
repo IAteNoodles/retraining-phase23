@@ -1819,14 +1819,34 @@ class ReinforceTrainer(VRAMSafeTrainer):
                         del all_candidate_ids
                         torch.cuda.empty_cache()
                     else:
-                        gen_ids = model_for_ops.generate(
-                            input_ids=inputs["input_ids"],
-                            attention_mask=inputs["attention_mask"],
-                            max_new_tokens=self.args.generation_max_length,
-                            do_sample=False,
-                            num_beams=1,
-                            logits_processor=LogitsProcessorList([_gen_prog]),
-                        )
+                        # Heavy batches (longest 0.03%): generate one sample at
+                        # a time so peak stays flat instead of x batch_size.
+                        _heavy = inputs["input_ids"].shape[1] > 1024
+                        if _heavy:
+                            if is_main_process():
+                                print(f"  [GEN] step={self.state.global_step} heavy batch: sequential generation ({batch_size} samples)", flush=True)
+                            _parts = []
+                            for _bi in range(batch_size):
+                                _parts.append(model_for_ops.generate(
+                                    input_ids=inputs["input_ids"][_bi:_bi + 1],
+                                    attention_mask=inputs["attention_mask"][_bi:_bi + 1],
+                                    max_new_tokens=self.args.generation_max_length,
+                                    do_sample=False,
+                                    num_beams=1,
+                                    logits_processor=LogitsProcessorList([_gen_prog]),
+                                ))
+                            _L = max(p.shape[1] for p in _parts)
+                            gen_ids = torch.cat([torch.nn.functional.pad(p, (0, _L - p.shape[1]), value=self.reinforce_tokenizer.pad_token_id) for p in _parts], dim=0)
+                            del _parts
+                        else:
+                            gen_ids = model_for_ops.generate(
+                                input_ids=inputs["input_ids"],
+                                attention_mask=inputs["attention_mask"],
+                                max_new_tokens=self.args.generation_max_length,
+                                do_sample=False,
+                                num_beams=1,
+                                logits_processor=LogitsProcessorList([_gen_prog]),
+                            )
                 model_for_ops.config.use_cache = False
             if _gen_training:
                 model_for_ops.train()
@@ -1933,6 +1953,8 @@ class ReinforceTrainer(VRAMSafeTrainer):
             except Exception as _e:
                 print(f"  [RollStream] skipped ({_e})", flush=True)
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             best_gen_ids = torch.stack(best_gen_ids)
             decoder_input_ids = best_gen_ids[:, :-1]
             target_ids = best_gen_ids[:, 1:]
@@ -1941,35 +1963,61 @@ class ReinforceTrainer(VRAMSafeTrainer):
                 attention_mask=inputs["attention_mask"],
                 decoder_input_ids=decoder_input_ids,
             )
-            log_probs = F.log_softmax(outputs2.logits, dim=-1)
-            probs = log_probs.exp()
-            token_log_probs = log_probs.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)
+            # Time-chunked softmax: full [B,T,262144] fp32 log-probs cost
+            # ~3.2 GB per tensor at T=384; chunking keeps peak at logits +
+            # one 64-step slice with bit-exact math.
+            logits = outputs2.logits
+            del outputs2
+            if self.kl_coef and self.kl_ref_model is not None:
+                with torch.no_grad():
+                    _ref = self.kl_ref_model(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        decoder_input_ids=decoder_input_ids,
+                    )
+                    ref_logits = _ref.logits
+                    del _ref
+            else:
+                ref_logits = None
             mask = (target_ids != self.reinforce_tokenizer.pad_token_id).float()
-            seq_log_prob = (token_log_probs * mask).sum(dim=-1)
+            _T = target_ids.shape[1]
+            _CH = 64
+            seq_log_prob = torch.zeros(batch_size, device=logits.device, dtype=torch.float32)
+            _ent_num = torch.zeros((), device=logits.device, dtype=torch.float32) if self.entropy_coef else None
+            _kl_num = torch.zeros((), device=logits.device, dtype=torch.float32) if ref_logits is not None else None
+            for _s in range(0, _T, _CH):
+                _e = min(_s + _CH, _T)
+                _lp = F.log_softmax(logits[:, _s:_e, :].float(), dim=-1)
+                _tlp = _lp.gather(2, target_ids[:, _s:_e].unsqueeze(-1)).squeeze(-1)
+                seq_log_prob = seq_log_prob + (_tlp * mask[:, _s:_e]).sum(dim=-1)
+                if _ent_num is not None:
+                    _ent_num = _ent_num + ((_lp.exp() * _lp).sum(dim=-1) * mask[:, _s:_e]).sum()
+                if _kl_num is not None:
+                    _rlp = F.log_softmax(ref_logits[:, _s:_e, :].float(), dim=-1)
+                    _kl_num = _kl_num + ((_lp.exp() * (_lp - _rlp)).sum(dim=-1) * mask[:, _s:_e]).sum()
+                    del _rlp
+                del _lp, _tlp
+            del logits
+            if ref_logits is not None:
+                del ref_logits
 
             reinforce_loss = -(seq_log_prob * advantage.detach()).mean()
             reinforce_loss = torch.nan_to_num(reinforce_loss, nan=0.0, posinf=0.0, neginf=0.0)
             total_loss = self.sft_coef * ce_loss + self.reinforce_coef * reinforce_loss
 
-            entropy = (-(probs * log_probs).sum(dim=-1) * mask).sum() / mask.sum().clamp_min(1.0)
-            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
-            if self.entropy_coef:
+            if _ent_num is not None:
+                entropy = -_ent_num / mask.sum().clamp_min(1.0)
+                entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
                 entropy_bonus = torch.clamp(entropy - self.entropy_min, min=0.0)
                 total_loss = total_loss - self.entropy_coef * entropy_bonus
+            else:
+                entropy = torch.zeros((), device=total_loss.device)
 
-            if self.kl_coef and self.kl_ref_model is not None:
-                with torch.no_grad():
-                    ref_outputs = self.kl_ref_model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        decoder_input_ids=decoder_input_ids,
-                    )
-                    ref_log_probs = F.log_softmax(ref_outputs.logits, dim=-1)
-                kl_tokens = (probs * (log_probs - ref_log_probs)).sum(dim=-1)
-                kl_loss = (kl_tokens * mask).sum() / mask.sum().clamp_min(1.0)
+            if _kl_num is not None:
+                kl_loss = _kl_num / mask.sum().clamp_min(1.0)
                 kl_loss = torch.nan_to_num(kl_loss, nan=0.0, posinf=0.0, neginf=0.0)
                 total_loss = total_loss + self.kl_coef * kl_loss
-                del ref_outputs, ref_log_probs, kl_tokens
+                del _kl_num
             else:
                 kl_loss = torch.tensor(0.0, device=total_loss.device)
 
@@ -1980,7 +2028,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
 
             total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
             print(f"  [RL_LOSS] reinforce={reinforce_loss.item():.4f} entropy={entropy.item():.4f} kl={kl_loss.item():.4f} total={total_loss.item():.4f}", flush=True)
-            del outputs2, log_probs, probs
+            del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
 
             return (total_loss, None) if return_outputs else total_loss
 
