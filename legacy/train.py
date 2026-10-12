@@ -2530,6 +2530,7 @@ def main():
     parser.add_argument("--eval_only", action="store_true", help="Only run post-training eval on best checkpoint")
     parser.add_argument("--eval_model_dir", type=str, default="", help="Explicit full model/checkpoint directory for --eval_only. Can point to best/, best_checkpoint/, checkpoint-*, merged_eval/, or a parent containing those.")
     parser.add_argument("--final_test_only", action="store_true", help="With --eval_only, skip validation eval and run only the final test set")
+    parser.add_argument("--skip_final_test", action="store_true", help="Skip the end-of-run test generation eval (e.g. when the final test runs on another machine)")
     parser.add_argument("--train_parquet", type=str, default="splits/train_t5.parquet")
     parser.add_argument("--val_parquet", type=str, default="splits/val_answerable.parquet")
     parser.add_argument("--test_parquet", type=str, default="splits/test_answerable.parquet")
@@ -3321,7 +3322,9 @@ def main():
                 json.dump(val_metrics, f, indent=2, default=str)
             print(f"Final eval metrics also saved to {final_val_metrics_path}")
 
-    if os.path.exists(test_parquet):
+    if args.skip_final_test:
+        print("Skipping final test generation eval (--skip_final_test; test runs on the eval machine).")
+    elif os.path.exists(test_parquet):
         print(f"\nLoading test dataset from {test_parquet}...")
         test_dataset = Text2CypherDataset(
             test_parquet, tokenizer,

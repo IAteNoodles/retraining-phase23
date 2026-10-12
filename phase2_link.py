@@ -232,7 +232,8 @@ class RollingCollector:
 
 
 def run_server(host, port, decide, auth=None, rolling_dir=None,
-               on_base_eval=None, rolling_hf_repo="", rolling_hf_token=""):
+               on_base_eval=None, rolling_hf_repo="", rolling_hf_token="",
+               on_done=None):
     """Laptop-side asyncio server. decide(step:int, payload:dict)
     -> (decision, reason). Runs until cancelled. CPU-only.
     auth: when set, EVAL_REQUEST must carry the same token or gets ERROR
@@ -267,6 +268,11 @@ def run_server(host, port, decide, auth=None, rolling_dir=None,
                 elif mtype == CHECKPOINT_DONE:
                     if _collector is not None:
                         _collector.finalize(msg.get("step", -1))
+                    if on_done is not None:
+                        try:
+                            on_done(int(msg.get("step", -1)), msg)
+                        except Exception:
+                            pass
                     await ws.send(json.dumps({"type": ACK,
                                               "step": msg.get("step", -1)}))
                 elif mtype == ROLLING_ROWS:
