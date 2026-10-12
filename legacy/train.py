@@ -1,6 +1,7 @@
 import argparse
 from contextlib import nullcontext
 import datetime
+import faulthandler
 import functools
 import gc
 import inspect
@@ -10,6 +11,7 @@ import re
 import requests
 import shutil
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -912,8 +914,11 @@ class VRAMSafeTrainer(Seq2SeqTrainer):
                             f"VRAM critical: {vram2['reserved_gb']:.1f}/{vram2['total_gb']:.1f} GB used. "
                             f"Reduce batch size or max_input_length."
                         )
+        stall_beat()
         try:
-            return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+            out = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+            stall_beat()
+            return out
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 torch.cuda.empty_cache()
@@ -1522,6 +1527,65 @@ def compute_reward_deadline(pred_cypher, gold_cypher, neo4j_client,
     return (-3.0, False, {"branch": "reward_timeout", "reward": -3.0})
 
 
+_stall_state = {"last_beat": None, "step": "?", "timeout_s": 300,
+                "cooldown_s": 300, "last_dump": 0.0, "running": False}
+
+
+def stall_beat(step=None):
+    _stall_state["last_beat"] = datetime.datetime.now()
+    if step is not None:
+        _stall_state["step"] = step
+
+
+def start_stall_watch(timeout_s=300, cooldown_s=0):
+    """Background watchdog: if no training progress for timeout_s, dump all
+    thread stacks + VRAM into the log (in-log auto-investigation, per rank).
+    Re-arms every cooldown_s (default = timeout_s). 0 disables."""
+    if timeout_s <= 0 or _stall_state["running"]:
+        return
+    if cooldown_s <= 0:
+        cooldown_s = timeout_s
+    _stall_state["timeout_s"] = timeout_s
+    _stall_state["cooldown_s"] = cooldown_s
+    try:
+        rank = int(os.environ.get("RANK", "-1"))
+    except Exception:
+        rank = -1
+    stall_beat()
+    _stall_state["running"] = True
+
+    def _watch():
+        _ev = threading.Event()
+        while True:
+            _ev.wait(30.0)
+            try:
+                lb = _stall_state["last_beat"]
+                if lb is None:
+                    continue
+                idle = (datetime.datetime.now() - lb).total_seconds()
+                now_ts = datetime.datetime.now().timestamp()
+                if idle >= _stall_state["timeout_s"] and now_ts - _stall_state["last_dump"] >= _stall_state["cooldown_s"]:
+                    _stall_state["last_dump"] = now_ts
+                    print(f"\n[STALL_WATCH][rank={rank}] NO training progress for {idle:.0f}s (step={_stall_state['step']}, timeout={_stall_state['timeout_s']}s). Dumping all thread stacks:", flush=True)
+                    try:
+                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                    except Exception as _e:
+                        print(f"[STALL_WATCH] faulthandler failed: {_e}", flush=True)
+                    try:
+                        if torch.cuda.is_available():
+                            print(f"[STALL_WATCH][rank={rank}] cuda reserved={torch.cuda.memory_reserved() / 1e9:.2f}G allocated={torch.cuda.memory_allocated() / 1e9:.2f}G", flush=True)
+                    except Exception:
+                        pass
+                    print(f"[STALL_WATCH][rank={rank}] end dump (re-arms in {_stall_state['cooldown_s']}s if still stalled)", flush=True)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watch, daemon=True, name="stall-watch")
+    t.start()
+    if rank <= 0:
+        print(f"[STALL_WATCH] armed (timeout={timeout_s}s, cooldown={cooldown_s}s)", flush=True)
+
+
 def print_reward_function_description():
     if not is_main_process():
         return
@@ -1715,6 +1779,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         model_for_ops = model.module if hasattr(model, "module") else model
+        stall_beat(getattr(getattr(self, "state", None), "global_step", "?"))
         model_float_dtype = get_model_float_dtype(model_for_ops)
         labels = inputs["labels"]
         do_reinforce = model.training and (self.state.global_step - self._last_reinforce_step >= 2)
@@ -2723,6 +2788,7 @@ def main():
     parser.add_argument("--reinforce_candidates", type=int, default=1, help="Generate N candidates per input, take best reward")
     parser.add_argument("--rl_warmup_steps", type=int, default=50, help="Number of SFT-only steps before RL kicks in; avoids RL on an untrained model")
     parser.add_argument("--rl_reward_timeout", type=int, default=30, help="Hard wall-clock deadline (s) per reward computation; fences DNS/proxy stalls, wedged calls score -3 and training continues. Kept small so DDP ranks cannot skew past the NCCL watchdog (sequential loop: worst skew ~= 8x this).")
+    parser.add_argument("--stall_watch_secs", type=int, default=300, help="In-log stall auto-investigation: if no training progress for this many seconds, dump all thread stacks + VRAM into the log (per rank, re-arms while stalled). 0 disables.")
     parser.add_argument("--reward_ema_alpha", type=float, default=0.1, help="EMA smoothing for reward baseline")
     parser.add_argument("--entropy_coef", type=float, default=0.0, help="Entropy bonus coefficient for sampled RL tokens")
     parser.add_argument("--entropy_beta", type=float, default=None, help="Alias for --entropy_coef from trainv1")
@@ -2817,6 +2883,8 @@ def main():
     if _ddp_world > 1 and torch.cuda.is_available():
         torch.cuda.set_device(_ddp_local_rank % max(torch.cuda.device_count(), 1))
         print(f"[DDP] rank {os.environ.get('RANK', _ddp_local_rank)}/{_ddp_world} pinned to cuda:{torch.cuda.current_device()}", flush=True)
+
+    start_stall_watch(getattr(args, "stall_watch_secs", 300))
 
     if args.entropy_beta is not None:
         args.entropy_coef = args.entropy_beta
