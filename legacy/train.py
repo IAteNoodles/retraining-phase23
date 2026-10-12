@@ -1446,6 +1446,37 @@ def _reward_value(reward_result):
     return float(reward_result)
 
 
+def _grad_ckpt(model_for_ops, enable):
+    """Toggle gradient checkpointing around RL generation.
+
+    Generation runs under no_grad, so checkpointing only costs speed
+    (it forces use_cache=False: ~384 full forwards per sample). Training
+    forwards keep it for VRAM. Returns True if the toggle took effect.
+    """
+    name = ("gradient_checkpointing_enable" if enable
+            else "gradient_checkpointing_disable")
+    seen = set()
+    stack = [model_for_ops]
+    while stack:
+        o = stack.pop()
+        if o is None or id(o) in seen:
+            continue
+        seen.add(id(o))
+        fn = getattr(o, name, None)
+        if callable(fn):
+            try:
+                fn()
+                return True
+            except Exception:
+                pass
+        for attr in ("base_model", "model", "module"):
+            try:
+                stack.append(getattr(o, attr, None))
+            except Exception:
+                pass
+    return False
+
+
 def compute_reward_deadline(pred_cypher, gold_cypher, neo4j_client,
                             timeout_s=120, **kwargs):
     """compute_reward with a hard wall-clock deadline.
@@ -1670,14 +1701,6 @@ class ReinforceTrainer(VRAMSafeTrainer):
         model_float_dtype = get_model_float_dtype(model_for_ops)
         labels = inputs["labels"]
         do_reinforce = model.training and (self.state.global_step - self._last_reinforce_step >= 2)
-        # Monster batches (1600-token rows): no-KV-cache generation costs
-        # ~10 min/microbatch for 0.03% of data. SFT-only past 1024 tokens.
-        seq_len = inputs["input_ids"].shape[1]
-        if do_reinforce and seq_len > 1024:
-            do_reinforce = False
-            if is_main_process() and self.state.global_step != getattr(self, "_last_long_skip_log", -1):
-                print(f"  [RL_SKIP] SFT-only at step={self.state.global_step} (batch seq_len={seq_len} > 1024)", flush=True)
-                self._last_long_skip_log = self.state.global_step
 
         if do_reinforce:
             model_for_ops.config.output_hidden_states = True
@@ -1717,6 +1740,10 @@ class ReinforceTrainer(VRAMSafeTrainer):
             n_candidates = self.reinforce_candidates
             use_multi = n_candidates > 1
 
+            _ckpt_off = _grad_ckpt(model_for_ops, False)
+            if is_main_process() and self.state.global_step != getattr(self, "_last_ckpt_log", -1):
+                print(f"  [CKPT] checkpointing {'suspended' if _ckpt_off else 'STILL ON (slow gen)'} for RL generation at step={self.state.global_step}", flush=True)
+                self._last_ckpt_log = self.state.global_step
             with torch.no_grad():
                 autocast_ctx = nullcontext()
                 if torch.cuda.is_available() and model_float_dtype in (torch.float16, torch.bfloat16):
@@ -1775,6 +1802,8 @@ class ReinforceTrainer(VRAMSafeTrainer):
                             num_beams=1,
                         )
                 model_for_ops.config.use_cache = False
+            if _ckpt_off:
+                _grad_ckpt(model_for_ops, True)
             gc.collect()
 
             pred_texts = self.reinforce_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
