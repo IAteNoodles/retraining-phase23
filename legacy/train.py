@@ -2137,6 +2137,28 @@ class ReinforceTrainer(VRAMSafeTrainer):
             if is_main_process():
                 _dt2 = (datetime.datetime.now() - _gen_t0).total_seconds()
                 print(f"  [RL_FWD] step={self.state.global_step} forward done in {_dt2:.1f}s (backward next)", flush=True)
+            if batch_size > 1 and not self.entropy_coef and not self.kl_coef:
+                # VRAM: per-sample sequential backward. The batched RL graph
+                # (~1 GB/sample of chunked-softmax saves) OOMs 6 GB GPUs past
+                # batch 1; freeing each sample's graph in turn restores the
+                # batch-1 peak. Bit-exact vs one joint backward (sum of grads;
+                # Trainer scaling mirrored: divide by grad-accum steps here,
+                # return a grad-free leaf so Trainer's own backward is a no-op).
+                # Batch-1 path below untouched (Kaggle identical).
+                _gas = float(getattr(self.args, "gradient_accumulation_steps", 1) or 1)
+                _adv = advantage.detach()
+                _rb0 = datetime.datetime.now()
+                (self.sft_coef * ce_loss / _gas).backward()
+                for _i in range(batch_size):
+                    (-(seq_log_prob[_i] * _adv[_i]) * (self.reinforce_coef / (batch_size * _gas))).backward()
+                if self.critic is not None and not self.disable_critic:
+                    (0.1 * critic_loss / _gas).backward()
+                if is_main_process():
+                    _dt3 = (datetime.datetime.now() - _rb0).total_seconds()
+                    print(f"  [RL_BWD] step={self.state.global_step} per-sample sequential backward done in {_dt3:.1f}s", flush=True)
+                _ret = total_loss.detach().requires_grad_()
+                del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
+                return (_ret, None) if return_outputs else _ret
             del best_gen_ids, decoder_input_ids, target_ids, mask, seq_log_prob
 
             return (total_loss, None) if return_outputs else total_loss
