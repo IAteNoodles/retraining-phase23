@@ -1732,6 +1732,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
     consistency_coef=0.0, dynamic_batch=False, max_tokens=50000,
                  dynamic_generation_length=False, generation_length_tolerance=0.10,
                  rl_warmup_steps=0, roll_stream=None, reward_timeout=30,
+                 rl_rolling_jsonl=None,
                  **kwargs):
         model = kwargs.get('model')
         if model is not None:
@@ -1747,6 +1748,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
         super().__init__(*args, **kwargs)
         self.neo4j_client = neo4j_client
         self.roll_stream = roll_stream
+        self.rl_rolling_jsonl = rl_rolling_jsonl
         self.reinforce_coef = reinforce_coef
         self.reward_ema = 0.5
         self.reward_ema_alpha = reward_ema_alpha
@@ -2043,19 +2045,27 @@ class ReinforceTrainer(VRAMSafeTrainer):
                 print(f"  [R] step={self.state.global_step} jac=[{jac_str}] em=[{em_str}] rwd=[{rwd_str}] adv=[{adv_str}] ema={self.reward_ema:.3f} ce={ce_loss.item():.4f}", flush=True)
             print(f"  [R_DETAIL] branches={branches}", flush=True)
 
-            # Stream best-per-sample generations to the laptop rolling sink
-            # (rank 0 only, fail-open: RollStream never raises).
+            # Stream best-per-sample generations to the rolling sinks
+            # (rank 0 only, fail-open). Local jsonl always available via
+            # --rl_rolling_jsonl; websocket RollStream only when configured.
             try:
-                if (getattr(self, "roll_stream", None) is not None
+                if ((getattr(self, "roll_stream", None) is not None
+                        or getattr(self, "rl_rolling_jsonl", None))
                         and is_main_process()):
                     _step = int(getattr(getattr(self, "state", None),
                                         "global_step", 0))
                     _best_texts = self.reinforce_tokenizer.batch_decode(
                         best_gen_ids, skip_special_tokens=True)
-                    self.roll_stream.add(build_roll_rows(
+                    _rows = build_roll_rows(
                         _step, _best_texts, gold_texts,
                         [rewards[i].item() for i in range(batch_size)],
-                        branches, databases, input_texts))
+                        branches, databases, input_texts)
+                    if getattr(self, "roll_stream", None) is not None:
+                        self.roll_stream.add(_rows)
+                    if getattr(self, "rl_rolling_jsonl", None):
+                        _append_rolling_generation_records(
+                            _rows, self.rl_rolling_jsonl,
+                            max_json_records=2000)
             except Exception as _e:
                 print(f"  [RollStream] skipped ({_e})", flush=True)
 
@@ -2219,7 +2229,7 @@ def run_training_phase(
     max_target_length, predict_with_generate, seed, vram_limit_gb,
     resume_checkpoint=None, phase_name="phase1", min_epochs=0,
     label_smoothing=0.0, weight_decay=0.01, neftune_noise_alpha=5.0,
-    eval_steps=200, eval_batch_size=0, use_reinforce=False, neo4j_client=None, roll_stream=None, reinforce_coef=0.3,
+     eval_steps=200, eval_batch_size=0, use_reinforce=False, neo4j_client=None, roll_stream=None, rl_rolling_jsonl="", reinforce_coef=0.3,
     reinforce_candidates=1, critic_lr=1e-4, disable_critic=False,
     reward_ema_alpha=0.1,
     entropy_coef=0.0, entropy_min=0.0, exact_match_weight=0.3,
@@ -2385,6 +2395,7 @@ def run_training_phase(
         trainer = ReinforceTrainer(
             neo4j_client=neo4j_client,
             roll_stream=roll_stream,
+            rl_rolling_jsonl=rl_rolling_jsonl or "",
             reinforce_coef=reinforce_coef,
             reinforce_tokenizer=tokenizer,
             reinforce_candidates=reinforce_candidates,
@@ -2973,6 +2984,7 @@ def main():
     parser.add_argument("--roll_ws_auth", type=str, default="", help="Token for rolling-stream messages")
     parser.add_argument("--roll_ws_proxy", type=str, default="", help="Optional socks5://host:port for the rolling stream (userspace-tailscale Kaggle)")
     parser.add_argument("--roll_flush_every", type=int, default=50, help="Rolling-stream rows per flush")
+    parser.add_argument("--rl_rolling_jsonl", type=str, default="", help="Local jsonl path for per-RL-step generations ('' disables; e.g. <output_dir>/rolling_rl.jsonl)")
     parser.add_argument("--neo4j_preflight_mode", type=str, default="fallback", choices=["fallback", "dataset", "all_mapped"], help="Preflight DB check mode: fallback=only default DB, dataset=only mapped DBs in data, all_mapped=all DBs in mapping")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout rate")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing factor")
@@ -3461,6 +3473,7 @@ def main():
                     use_reinforce=args.phase2_reinforce,
                     neo4j_client=neo4j_client,
                     roll_stream=roll_stream,
+                    rl_rolling_jsonl=args.rl_rolling_jsonl,
                     reinforce_coef=args.reinforce_coef,
                     reinforce_candidates=args.reinforce_candidates,
                     reward_ema_alpha=args.reward_ema_alpha,
