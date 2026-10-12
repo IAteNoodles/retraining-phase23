@@ -1477,6 +1477,23 @@ def _grad_ckpt(model_for_ops, enable):
     return False
 
 
+class _GenProgress(LogitsProcessor):
+    """Heartbeat during RL generation: proves the run is alive on long batches."""
+    def __init__(self, step, verbose, every=50):
+        self.step = step
+        self.verbose = verbose
+        self.every = every
+        self.n = 0
+        self.t0 = datetime.datetime.now()
+
+    def __call__(self, input_ids, scores):
+        self.n += 1
+        if self.verbose and self.n % self.every == 0:
+            dt = (datetime.datetime.now() - self.t0).total_seconds()
+            print(f"  [GEN] step={self.step} generating... tok={self.n} elapsed={dt:.1f}s ({self.n / max(dt, 1e-3):.1f} tok/s)", flush=True)
+        return scores
+
+
 def compute_reward_deadline(pred_cypher, gold_cypher, neo4j_client,
                             timeout_s=120, **kwargs):
     """compute_reward with a hard wall-clock deadline.
@@ -1741,8 +1758,15 @@ class ReinforceTrainer(VRAMSafeTrainer):
             use_multi = n_candidates > 1
 
             _ckpt_off = _grad_ckpt(model_for_ops, False)
+            _gen_training = model_for_ops.training
+            # generate() forces use_cache=False when training==True (checked
+            # alongside the ckpt flag). Eval mode re-enables the KV cache;
+            # generation runs under no_grad so this is inference-safe.
+            model_for_ops.eval()
+            _gen_t0 = datetime.datetime.now()
+            _gen_prog = _GenProgress(self.state.global_step, is_main_process())
             if is_main_process() and self.state.global_step != getattr(self, "_last_ckpt_log", -1):
-                print(f"  [CKPT] checkpointing {'suspended' if _ckpt_off else 'STILL ON (slow gen)'} for RL generation at step={self.state.global_step}", flush=True)
+                print(f"  [CKPT] ckpt-toggle={'off' if _ckpt_off else 'FAILED'} eval-mode=on for RL generation at step={self.state.global_step}", flush=True)
                 self._last_ckpt_log = self.state.global_step
             with torch.no_grad():
                 autocast_ctx = nullcontext()
@@ -1776,6 +1800,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
                             logits_processors = LogitsProcessorList()
                             # Always sanitize logits to prevent NaN/Inf in sampling
                             logits_processors.append(SanitizeLogitsProcessor())
+                            logits_processors.append(_gen_prog)
                             if self.train_noise_scale > 0:
                                 logits_processors.append(GaussianNoiseProcessor(self.train_noise_scale))
                             c_ids = model_for_ops.generate(
@@ -1800,10 +1825,17 @@ class ReinforceTrainer(VRAMSafeTrainer):
                             max_new_tokens=self.args.generation_max_length,
                             do_sample=False,
                             num_beams=1,
+                            logits_processor=LogitsProcessorList([_gen_prog]),
                         )
                 model_for_ops.config.use_cache = False
+            if _gen_training:
+                model_for_ops.train()
             if _ckpt_off:
                 _grad_ckpt(model_for_ops, True)
+            if is_main_process():
+                _dt = (datetime.datetime.now() - _gen_t0).total_seconds()
+                _new = gen_ids.shape[1] - inputs["input_ids"].shape[1]
+                print(f"  [GEN] step={self.state.global_step} generated ~{_new} new tokens in {_dt:.1f}s", flush=True)
             gc.collect()
 
             pred_texts = self.reinforce_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
