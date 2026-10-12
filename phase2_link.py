@@ -32,6 +32,9 @@ VERDICT = "VERDICT"
 CHECKPOINT_DONE = "CHECKPOINT_DONE"
 ACK = "ACK"
 ERROR = "ERROR"
+ROLLING_ROWS = "ROLLING_ROWS"
+BASE_EVAL_REQUEST = "BASE_EVAL_REQUEST"
+BASE_EVAL_ACK = "BASE_EVAL_ACK"
 
 CONTINUE = "CONTINUE"
 STOP = "STOP"
@@ -127,7 +130,109 @@ class EvalGate:
             pass
 
 
-def run_server(host, port, decide, auth=None):
+class RollStream:
+    """Trainer-side buffered sender for RL rolling rows. Fail-open: never
+    raises; drops rows when unreachable. Flushes every `flush_every` rows
+    over a fresh websocket (no long-lived connection to babysit)."""
+
+    def __init__(self, url, auth=None, proxy=None, flush_every=50):
+        self.url = url
+        self.auth = auth
+        self.proxy = proxy
+        self.flush_every = max(1, flush_every)
+        self.buf = []
+
+    def add(self, rows):
+        try:
+            self.buf.extend(rows)
+            if len(self.buf) >= self.flush_every:
+                self.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        import websocket
+        import json as _json
+        rows, self.buf = self.buf, []
+        if not rows or not self.url:
+            return
+        try:
+            kw = dict(timeout=20)
+            if self.proxy and self.url.startswith("ws://"):
+                kw.update(http_proxy_host=self.proxy[0],
+                          http_proxy_port=self.proxy[1],
+                          proxy_type="socks5h")
+            ws = websocket.create_connection(self.url, **kw)
+            try:
+                ws.send(_json.dumps({"type": ROLLING_ROWS, "step": rows[-1].get("step", -1),
+                                     "rows": rows, "auth": self.auth}))
+            finally:
+                ws.close()
+        except Exception:
+            pass
+
+
+class RollingCollector:
+    """Laptop-side sink: buckets rows into per-checkpoint-window jsonl files.
+
+    With hf_repo set, each closed window uploads to
+    `<hf_prefix>/rolling_ckpt_<base>.jsonl` (upload on rollover and on
+   1632 finalize()). Uploads never raise (fail-open, local files are source
+    of truth).
+    """
+
+    def __init__(self, out_dir, window=500, hf_repo="", hf_token="",
+                 hf_prefix="PHASE_2_KAGGLE/rolling"):
+        import pathlib
+        self.out_dir = pathlib.Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.window = window
+        self.hf_repo = hf_repo
+        self.hf_token = hf_token
+        self.hf_prefix = hf_prefix.strip("/")
+        self._cur_base = None
+
+    def ingest(self, step, rows):
+        import json as _json
+        base = (int(step) // self.window) * self.window
+        if self._cur_base is not None and base != self._cur_base:
+            self.upload_window(self._cur_base)
+        self._cur_base = base
+        path = self.out_dir / f"rolling_ckpt_{base}.jsonl"
+        with open(path, "a") as f:
+            for r in rows:
+                f.write(_json.dumps(r) + "\n")
+        return str(path)
+
+    def files(self):
+        return sorted(self.out_dir.glob("rolling_ckpt_*.jsonl"))
+
+    def upload_window(self, base):
+        if not self.hf_repo:
+            return None
+        try:
+            from huggingface_hub import upload_file
+            path = self.out_dir / f"rolling_ckpt_{base}.jsonl"
+            if not path.exists():
+                return None
+            where = upload_file(path_or_fileobj=str(path),
+                                path_in_repo=f"{self.hf_prefix}/rolling_ckpt_{base}.jsonl",
+                                repo_id=self.hf_repo, token=self.hf_token or None)
+            print(f"[rolling] uploaded window {base} -> {where}", flush=True)
+            return where
+        except Exception as e:
+            print(f"[rolling] upload failed window {base}: {e}", flush=True)
+            return None
+
+    def finalize(self, step):
+        """Upload the in-progress window (call on CHECKPOINT_DONE)."""
+        base = (int(step) // self.window) * self.window
+        self.upload_window(base)
+        self._cur_base = base
+
+
+def run_server(host, port, decide, auth=None, rolling_dir=None,
+               on_base_eval=None):
     """Laptop-side asyncio server. decide(step:int, payload:dict)
     -> (decision, reason). Runs until cancelled. CPU-only.
     auth: when set, EVAL_REQUEST must carry the same token or gets ERROR
@@ -162,11 +267,34 @@ def run_server(host, port, decide, auth=None):
                 elif mtype == CHECKPOINT_DONE:
                     await ws.send(json.dumps({"type": ACK,
                                               "step": msg.get("step", -1)}))
+                elif mtype == ROLLING_ROWS:
+                    if auth is not None and msg.get("auth") != auth:
+                        await ws.send(json.dumps({"type": ERROR,
+                                                  "detail": "bad auth"}))
+                        continue
+                    rows = msg.get("rows", [])
+                    if rolling_dir is not None:
+                        _collector.ingest(msg.get("step", -1), rows)
+                    await ws.send(json.dumps({"type": ACK,
+                                              "step": msg.get("step", -1),
+                                              "rows": len(rows)}))
+                elif mtype == BASE_EVAL_REQUEST:
+                    if auth is not None and msg.get("auth") != auth:
+                        await ws.send(json.dumps({"type": ERROR,
+                                                  "detail": "bad auth"}))
+                        continue
+                    note = ("queued (stub)" if on_base_eval is None
+                            else on_base_eval(int(msg.get("step", 0)), msg))
+                    await ws.send(json.dumps({"type": BASE_EVAL_ACK,
+                                              "step": msg.get("step", 0),
+                                              "note": str(note)}))
                 else:
                     await ws.send(json.dumps({"type": ERROR,
                                               "detail": f"unknown type {mtype}"}))
         except Exception:
             pass
+
+    _collector = RollingCollector(rolling_dir) if rolling_dir else None
 
     async def _main():
         async with await websockets.serve(handler, host, port):

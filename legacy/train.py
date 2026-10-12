@@ -252,6 +252,27 @@ def _append_rolling_generation_records(records, rolling_jsonl_path, max_json_rec
     return rolling_json_path
 
 
+def build_roll_rows(step, best_texts, gold_texts, rewards, branches, databases, input_texts):
+    """Pure helper: RL best-per-sample rows for the rolling stream.
+
+    All args are plain lists (no tensors) so this is unit-testable CPU-only.
+    rewards may be floats or .item()-ables.
+    """
+    rows = []
+    for i in range(len(best_texts)):
+        r = rewards[i]
+        rows.append({
+            "step": int(step),
+            "input": input_texts[i] if i < len(input_texts) else None,
+            "pred": str(best_texts[i]).strip(),
+            "gold": str(gold_texts[i]).strip(),
+            "reward": float(r.item() if hasattr(r, "item") else r),
+            "branch": branches[i] if i < len(branches) else "unknown",
+            "database": databases[i] if i < len(databases) else None,
+        })
+    return rows
+
+
 def run_generation_eval(eval_model, dataset, tokenizer, collator, max_target_length, output_path, label="eval", eval_batch_size=8, neo4j_client=None, phase_name="eval", rolling_jsonl_path=None, rolling_json_max_records=1000):
     from torch.utils.data import DataLoader
     from tqdm import tqdm
@@ -1530,7 +1551,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
                  diversity_coef=0.0, simplicity_coef=0.0,
                  consistency_coef=0.0, dynamic_batch=False, max_tokens=50000,
                  dynamic_generation_length=False, generation_length_tolerance=0.10,
-                 rl_warmup_steps=0,
+                 rl_warmup_steps=0, roll_stream=None,
                  **kwargs):
         model = kwargs.get('model')
         if model is not None:
@@ -1545,6 +1566,7 @@ class ReinforceTrainer(VRAMSafeTrainer):
             self.critic = None
         super().__init__(*args, **kwargs)
         self.neo4j_client = neo4j_client
+        self.roll_stream = roll_stream
         self.reinforce_coef = reinforce_coef
         self.reward_ema = 0.5
         self.reward_ema_alpha = reward_ema_alpha
@@ -1791,6 +1813,22 @@ class ReinforceTrainer(VRAMSafeTrainer):
                 print(f"  [R] step={self.state.global_step} jac=[{jac_str}] em=[{em_str}] rwd=[{rwd_str}] adv=[{adv_str}] ema={self.reward_ema:.3f} ce={ce_loss.item():.4f}", flush=True)
             print(f"  [R_DETAIL] branches={branches}", flush=True)
 
+            # Stream best-per-sample generations to the laptop rolling sink
+            # (rank 0 only, fail-open: RollStream never raises).
+            try:
+                if (getattr(self, "roll_stream", None) is not None
+                        and is_main_process()):
+                    _step = int(getattr(getattr(self, "state", None),
+                                        "global_step", 0))
+                    _best_texts = self.reinforce_tokenizer.batch_decode(
+                        best_gen_ids, skip_special_tokens=True)
+                    self.roll_stream.add(build_roll_rows(
+                        _step, _best_texts, gold_texts,
+                        [rewards[i].item() for i in range(batch_size)],
+                        branches, databases, input_texts))
+            except Exception as _e:
+                print(f"  [RollStream] skipped ({_e})", flush=True)
+
             best_gen_ids = torch.stack(best_gen_ids)
             decoder_input_ids = best_gen_ids[:, :-1]
             target_ids = best_gen_ids[:, 1:]
@@ -1861,7 +1899,7 @@ def run_training_phase(
     max_target_length, predict_with_generate, seed, vram_limit_gb,
     resume_checkpoint=None, phase_name="phase1", min_epochs=0,
     label_smoothing=0.0, weight_decay=0.01, neftune_noise_alpha=5.0,
-    eval_steps=200, eval_batch_size=0, use_reinforce=False, neo4j_client=None, reinforce_coef=0.3,
+    eval_steps=200, eval_batch_size=0, use_reinforce=False, neo4j_client=None, roll_stream=None, reinforce_coef=0.3,
     reinforce_candidates=1, critic_lr=1e-4, disable_critic=False,
     reward_ema_alpha=0.1,
     entropy_coef=0.0, entropy_min=0.0, exact_match_weight=0.3,
@@ -2019,6 +2057,7 @@ def run_training_phase(
     if use_reinforce and neo4j_client is not None:
         trainer = ReinforceTrainer(
             neo4j_client=neo4j_client,
+            roll_stream=roll_stream,
             reinforce_coef=reinforce_coef,
             reinforce_tokenizer=tokenizer,
             reinforce_candidates=reinforce_candidates,
@@ -2579,6 +2618,10 @@ def main():
     parser.add_argument("--neo4j_auto_select", action="store_true", help="Use the first reachable Neo4j endpoint without prompting when multiple are available")
     parser.add_argument("--neo4j_skip_discovery", action="store_true", help="Skip train.py Neo4j discovery because the notebook already preflighted and selected --neo4j_url")
     parser.add_argument("--neo4j_proxies", type=str, default="", help="Optional proxy URL applied to http+https (e.g. socks5://localhost:1055 for userspace-tailscale Kaggle)")
+    parser.add_argument("--roll_ws_url", type=str, default="", help="Rolling-stream websocket URL ('' disables streaming RL generations to laptop)")
+    parser.add_argument("--roll_ws_auth", type=str, default="", help="Token for rolling-stream messages")
+    parser.add_argument("--roll_ws_proxy", type=str, default="", help="Optional socks5://host:port for the rolling stream (userspace-tailscale Kaggle)")
+    parser.add_argument("--roll_flush_every", type=int, default=50, help="Rolling-stream rows per flush")
     parser.add_argument("--neo4j_preflight_mode", type=str, default="fallback", choices=["fallback", "dataset", "all_mapped"], help="Preflight DB check mode: fallback=only default DB, dataset=only mapped DBs in data, all_mapped=all DBs in mapping")
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout rate")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing factor")
@@ -2977,6 +3020,22 @@ def main():
                         model.load_state_dict(adapter_weights, strict=False)
                         print("Loaded Phase 2 adapter weights from checkpoint")
                 neo4j_client = None
+                roll_stream = None
+                if args.phase2_reinforce and args.roll_ws_url:
+                    try:
+                        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+                        from phase2_link import RollStream
+                        _proxy = None
+                        if args.roll_ws_proxy:
+                            _proxy = args.roll_ws_proxy.replace("socks5://", "").split(":")
+                            _proxy = (_proxy[0], int(_proxy[1]))
+                        roll_stream = RollStream(args.roll_ws_url, auth=args.roll_ws_auth or None,
+                                                 proxy=_proxy, flush_every=args.roll_flush_every)
+                        if is_main_process():
+                            print(f"Rolling stream -> {args.roll_ws_url} every {args.roll_flush_every} rows")
+                    except Exception as e:
+                        print(f"Rolling stream disabled ({e})")
+                        roll_stream = None
                 if args.phase2_reinforce:
                     print_reward_function_description()
                     proxies = ({"http": args.neo4j_proxies,
@@ -3023,6 +3082,7 @@ def main():
                     eval_batch_size=eval_batch_size,
                     use_reinforce=args.phase2_reinforce,
                     neo4j_client=neo4j_client,
+                    roll_stream=roll_stream,
                     reinforce_coef=args.reinforce_coef,
                     reinforce_candidates=args.reinforce_candidates,
                     reward_ema_alpha=args.reward_ema_alpha,
